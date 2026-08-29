@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/starlet-mark-dark.svg">
+  <img alt="Starlet" src="docs/assets/starlet-mark-light.svg" width="64" height="64">
+</picture>
+
 # Starlet
 
 A local-first desktop search engine for your GitHub stars. Native Rust,
