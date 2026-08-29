@@ -6,8 +6,8 @@
 # Starlet
 
 A local-first desktop search engine for your GitHub stars. Native Rust,
-[GPUI][gpui], SQLite. Opens to one input on a dark canvas; type and the results
-are already there.
+[GPUI][gpui], SQLite. Signed out it opens on one button; signed in, one input
+on a dark canvas — type and the results are already there.
 
 Starlet mirrors your stars into a local database and searches that. The search
 path never touches the network, so results appear in under a millisecond
@@ -137,20 +137,25 @@ touch.
 | Type | Search |
 | `↑` `↓`, `Ctrl+K` `Ctrl+J` | Move the highlight |
 | `Cmd+↑` `Cmd+↓` | First / last result |
-| `Enter` | Open the repository in your browser |
+| `Enter` | Open the repository in your browser — or sign in, on the sign-in screen |
 | `Space` | Open the detail sheet — when the table has focus |
 | `Cmd+C` | Copy the repository URL |
 | `Cmd+K` (macOS) / `Ctrl+Shift+P` | Command palette |
 | `Cmd+B` | Toggle the filter sidebar |
 | `Cmd+,` | Settings |
 | `Cmd+R` | Sync now |
-| `Esc` | Close the sheet → clear the query → home |
+| `Esc` | Close the sheet → clear the query → home. On the sign-in screen, search offline |
 | `Tab` | Move focus between input, table, and sheet |
 
 `Cmd` is `Ctrl` on Linux and Windows. The palette is the one exception: on
 those platforms `Ctrl+K` already moves the selection, so the palette takes
-`Ctrl+Shift+P`. The toolbar renders whichever chord is actually bound. See
+`Ctrl+Shift+P`. The toolbar and the command palette render whichever chord is
+actually bound, read back out of the keymap, so a label can never advertise a
+shortcut this platform does not have. See
 [ADR 11](docs/adr/0011-platform-keybindings.md).
+
+The filter sidebar follows the query: it appears with the results and goes away
+at home. Toggling it explicitly pins it for the session.
 
 ## Architecture
 
@@ -236,9 +241,21 @@ One ADR per decision that would otherwise need archaeology:
 
 ## Development
 
+Tasks run through [`just`](https://github.com/casey/just); `just` on its own
+lists them.
+
 ```sh
-cargo test --workspace           # 175 tests
-cargo clippy --workspace --all-targets -- -D warnings
+just ci          # fmt-check, clippy, tests, build — everything CI runs
+just test        # 181 tests
+just demo        # seed 5 000 synthetic stars and launch against them
+just bench       # the performance budgets, with the measured numbers
+```
+
+The underlying commands are plain cargo if you prefer them:
+
+```sh
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
 ```
 
@@ -251,7 +268,7 @@ they run headless in CI.
 | `store` | migrations, FTS triggers, tag sources, upsert preservation, performance |
 | `sync` | 15 `wiremock` fixtures: pagination, watermark, unstars, 304s, rate limits, device flow |
 | `ai` | JSON extraction against malformed samples, one `wiremock` suite per provider, batching and cancellation |
-| `ui` | 16 `#[gpui::test]` interaction and overlay tests plus unit tests for formatting, facets, and the palette |
+| `ui` | 22 `#[gpui::test]` interaction and overlay tests plus unit tests for formatting, facets, and the palette |
 
 ## Licence
 
