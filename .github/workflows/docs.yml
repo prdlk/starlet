@@ -34,12 +34,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  # Blume writes `.blume/` next to the config. Point every command at the
-  # isolated runtime so a developer running `blume dev` locally and CI never
-  # contend over the same generated Astro project.
-  BLUME_RUNTIME_DIR: .blume-verify
-
 jobs:
   build:
     name: build
@@ -69,6 +63,10 @@ jobs:
       - name: blume validate
         run: bunx blume validate --strict
 
+      # Deliberately NOT isolated: `BLUME_RUNTIME_DIR` / `--isolated` relocate the
+      # output to `.blume-verify/dist` and skip the deploy post-steps, so the
+      # search index, sitemap, robots.txt and llms.txt would never be generated.
+      # Isolation exists to protect a local `blume dev`; there is none here.
       - name: blume build
         run: bunx blume build
 
