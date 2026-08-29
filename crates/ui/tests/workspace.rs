@@ -34,7 +34,9 @@ fn repo(id: i64, full_name: &str, description: &str, stars: i64) -> Repo {
 }
 
 /// Install the globals a workspace needs and seed a small corpus.
-fn boot(cx: &mut TestAppContext) -> (gpui::Entity<SearchView>, &mut VisualTestContext) {
+///
+/// Leaves the signed-out welcome screen up, which is what a real launch does.
+fn boot_signed_out(cx: &mut TestAppContext) -> (gpui::Entity<SearchView>, &mut VisualTestContext) {
     let runtime = Arc::new(
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -94,6 +96,16 @@ fn boot(cx: &mut TestAppContext) -> (gpui::Entity<SearchView>, &mut VisualTestCo
     (view, cx)
 }
 
+/// The same, then past the welcome screen onto the search field.
+///
+/// Most tests are about searching, not about signing in, so they start here.
+fn boot(cx: &mut TestAppContext) -> (gpui::Entity<SearchView>, &mut VisualTestContext) {
+    let (view, cx) = boot_signed_out(cx);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.dismiss_welcome(window, cx)));
+    settle(cx);
+    (view, cx)
+}
+
 /// Drain both executors. GPUI's test executor knows nothing about the Tokio
 /// runtime the store runs on, so parking alone is not enough.
 fn settle(cx: &mut VisualTestContext) {
@@ -133,6 +145,72 @@ async fn the_workspace_opens_at_home_with_every_repository_loaded(cx: &mut TestA
         // Home still ranks everything: the table exists, it is simply not shown.
         assert_eq!(view.result_count(cx), 4);
     });
+}
+
+#[gpui::test]
+async fn a_signed_out_launch_opens_on_the_sign_in_screen(cx: &mut TestAppContext) {
+    let (view, cx) = boot_signed_out(cx);
+    wait_for(cx, "the store to load", |cx| {
+        view.read_with(cx, |v, _| !v.repos().is_empty())
+    });
+
+    view.read_with(cx, |view, cx| {
+        assert!(
+            view.shows_welcome(cx),
+            "signing in is the first decision, not searching"
+        );
+        assert!(view.is_home());
+    });
+}
+
+#[gpui::test]
+async fn the_sign_in_screen_can_be_dismissed_to_search_the_local_mirror(cx: &mut TestAppContext) {
+    let (view, cx) = boot_signed_out(cx);
+    wait_for(cx, "the store to load", |cx| {
+        view.read_with(cx, |v, _| !v.repos().is_empty())
+    });
+
+    cx.update(|window, cx| view.update(cx, |view, cx| view.dismiss_welcome(window, cx)));
+    settle(cx);
+    assert!(!view.read_with(cx, |v, cx| v.shows_welcome(cx)));
+
+    // The query field is live again.
+    cx.simulate_input("helix");
+    settle(cx);
+    view.read_with(cx, |view, cx| {
+        assert!(!view.is_home());
+        assert_eq!(view.result_count(cx), 1);
+    });
+}
+
+#[gpui::test]
+async fn signing_in_replaces_the_welcome_screen(cx: &mut TestAppContext) {
+    let (view, cx) = boot_signed_out(cx);
+    assert!(view.read_with(cx, |v, cx| v.shows_welcome(cx)));
+
+    cx.update(|_, cx| {
+        cx.set_global(Session {
+            status: starlet_ui::AuthStatus::SignedIn,
+            github: None,
+            viewer: None,
+        })
+    });
+    settle(cx);
+    assert!(!view.read_with(cx, |v, cx| v.shows_welcome(cx)));
+}
+
+#[gpui::test]
+async fn signing_out_brings_the_welcome_screen_back(cx: &mut TestAppContext) {
+    let (view, cx) = boot_signed_out(cx);
+    cx.update(|window, cx| view.update(cx, |view, cx| view.dismiss_welcome(window, cx)));
+    settle(cx);
+    assert!(!view.read_with(cx, |v, cx| v.shows_welcome(cx)));
+
+    // A dismissal is for one session, not forever: after a sign-out the user
+    // is back at the same decision they started with.
+    cx.update(|_, cx| cx.set_global(Session::signed_out()));
+    settle(cx);
+    assert!(view.read_with(cx, |v, cx| v.shows_welcome(cx)));
 }
 
 #[gpui::test]
@@ -348,6 +426,56 @@ async fn tab_does_nothing_when_there_is_nothing_to_focus(cx: &mut TestAppContext
     assert!(
         !cx.update(|window, cx| view.read(cx).is_table_focused(window, cx)),
         "focus must not move into an empty table"
+    );
+}
+
+#[gpui::test]
+async fn the_filters_come_into_view_with_the_results(cx: &mut TestAppContext) {
+    let (view, cx) = boot(cx);
+    wait_for(cx, "the store to load", |cx| {
+        view.read_with(cx, |v, _| !v.repos().is_empty())
+    });
+
+    assert!(
+        !view.read_with(cx, |v, _| v.is_sidebar_open()),
+        "an empty canvas has nothing to filter"
+    );
+
+    cx.simulate_input("helix");
+    settle(cx);
+    assert!(
+        view.read_with(cx, |v, _| v.is_sidebar_open()),
+        "filters follow the results into view without being asked for"
+    );
+
+    // Clearing the query takes them away again.
+    cx.dispatch_action(Dismiss);
+    settle(cx);
+    assert!(!view.read_with(cx, |v, _| v.is_sidebar_open()));
+}
+
+#[gpui::test]
+async fn an_explicit_toggle_outranks_the_query(cx: &mut TestAppContext) {
+    let (view, cx) = boot(cx);
+    wait_for(cx, "the store to load", |cx| {
+        view.read_with(cx, |v, _| !v.repos().is_empty())
+    });
+
+    cx.simulate_input("helix");
+    settle(cx);
+    assert!(view.read_with(cx, |v, _| v.is_sidebar_open()));
+
+    // Someone who closes the panel has expressed a preference; the next
+    // keystroke must not reopen it.
+    cx.dispatch_action(starlet_ui::actions::ToggleSidebar);
+    settle(cx);
+    assert!(!view.read_with(cx, |v, _| v.is_sidebar_open()));
+
+    cx.simulate_input("-editor");
+    settle(cx);
+    assert!(
+        !view.read_with(cx, |v, _| v.is_sidebar_open()),
+        "the query stops deciding once the user has decided"
     );
 }
 

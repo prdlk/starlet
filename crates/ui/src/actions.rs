@@ -96,25 +96,3 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("down", SelectNext, Some(RESULTS_CONTEXT)),
     ]);
 }
-
-/// The label shown for the command palette, matching the binding registered
-/// above for this platform.
-pub const fn command_palette_shortcut() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "⌘K"
-    } else {
-        "⌃⇧P"
-    }
-}
-
-/// Render a `secondary-`prefixed chord the way this platform writes it.
-///
-/// The keymap uses one binding for both platforms; the label must not, or a
-/// Linux user reads `⌘R` for a shortcut that is actually Ctrl+R.
-pub fn secondary_shortcut(key: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("⌘{}", key.to_uppercase())
-    } else {
-        format!("Ctrl+{}", key.to_uppercase())
-    }
-}

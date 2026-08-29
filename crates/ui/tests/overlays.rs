@@ -64,6 +64,10 @@ fn boot(cx: &mut TestAppContext) -> (gpui::Entity<SearchView>, &mut VisualTestCo
     });
     let view = captured.borrow_mut().take().expect("workspace built");
     settle(cx);
+    // These tests are about overlays, not about signing in; step past the
+    // welcome screen so the search field is live.
+    cx.update(|window, cx| view.update(cx, |view, cx| view.dismiss_welcome(window, cx)));
+    settle(cx);
     (view, cx)
 }
 

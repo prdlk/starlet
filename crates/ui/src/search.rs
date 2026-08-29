@@ -30,6 +30,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
+    kbd::Kbd,
     table::{ColumnSort, Table, TableDelegate as _, TableEvent, TableState},
     v_flex,
 };
@@ -46,6 +47,7 @@ use crate::actions::{
 };
 use crate::detail::DetailSheet;
 use crate::filters::{FacetFilters, FilterPanel};
+use crate::format;
 use crate::palette::CommandPalette;
 use crate::results::{COL_LAST_COMMIT, COL_NAME, COL_STARS, ResultsDelegate, SortRequest};
 use crate::services::{Backend, Session};
@@ -91,7 +93,14 @@ pub struct SearchView {
     /// takes precedence over it.
     header_sort: Option<SortKey>,
 
-    sidebar_open: bool,
+    /// `None` follows the query: filters appear alongside results and go away
+    /// at home. `Some` is an explicit choice for this session, which the query
+    /// never overrides.
+    sidebar_choice: Option<bool>,
+    /// Set when a signed-out user chooses to search the local mirror anyway.
+    /// Reset whenever the session changes, so signing out brings the welcome
+    /// screen back rather than stranding the user on an empty canvas.
+    welcome_dismissed: bool,
     /// `flex_grow` the layout spacer animates away from, so a transition
     /// interrupted halfway still starts where the eye last saw it.
     hero_grow_from: f32,
@@ -99,6 +108,8 @@ pub struct SearchView {
     layout_generation: usize,
 
     sync: SyncStatus,
+    /// When the last sync finished, for the status line.
+    last_sync: Option<chrono::DateTime<chrono::Utc>>,
     /// Held so the work is cancelled when the view goes away.
     _sync_task: Option<Task<()>>,
     _schedule_task: Option<Task<()>>,
@@ -127,8 +138,14 @@ impl SearchView {
             cx.subscribe_in(&table, window, Self::on_table_event),
             cx.subscribe_in(&filters, window, Self::on_filter_event),
         ];
-        // The avatar and the empty state both depend on sign-in state.
-        subscriptions.push(cx.observe_global::<Session>(|_, cx| cx.notify()));
+        // The avatar, the welcome screen, and the empty state all depend on
+        // sign-in state.
+        subscriptions.push(cx.observe_global::<Session>(|this: &mut Self, cx| {
+            if !Session::is_signed_in(cx) {
+                this.welcome_dismissed = false;
+            }
+            cx.notify();
+        }));
 
         let mut this = Self {
             focus_handle: cx.focus_handle(),
@@ -141,10 +158,12 @@ impl SearchView {
             revision: 0,
             fts: HashMap::new(),
             header_sort: None,
-            sidebar_open: false,
+            sidebar_choice: None,
+            welcome_dismissed: false,
             hero_grow_from: 1.0,
             layout_generation: 0,
             sync: SyncStatus::Idle,
+            last_sync: None,
             _sync_task: None,
             _schedule_task: None,
             _fts_task: None,
@@ -152,7 +171,7 @@ impl SearchView {
         };
 
         this.load_from_store(cx);
-        this.restore_column_widths(cx);
+        this.restore_persisted_state(cx);
         this.schedule_background_sync(window, cx);
         // Focus has to be requested after the window exists, not while its
         // root view is still being constructed: a focus set during `new` is
@@ -362,6 +381,17 @@ impl SearchView {
         self.query.is_empty()
     }
 
+    /// Whether the canvas shows the sign-in screen instead of the search
+    /// field.
+    ///
+    /// Signed out, there is nothing to search until the first sync, so offering
+    /// a query field would invite the wrong action. The mirror survives a
+    /// sign-out though, so anyone who already has data can dismiss this and
+    /// keep searching offline.
+    pub fn shows_welcome(&self, cx: &App) -> bool {
+        !Session::is_signed_in(cx) && !self.welcome_dismissed
+    }
+
     // ------------------------------------------------------------- commands
 
     fn move_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -390,6 +420,13 @@ impl SearchView {
     }
 
     fn open_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter commits the emphasised action of whatever the canvas is
+        // currently asking. On the sign-in screen that is signing in, not
+        // opening a repository that is not on screen.
+        if self.shows_welcome(cx) {
+            SignInFlow::start(window, cx);
+            return;
+        }
         let Some(repo) = self.selected_repo(cx) else {
             return;
         };
@@ -400,7 +437,6 @@ impl SearchView {
                 tracing::warn!("could not open {url}: {err}");
             }
         });
-        let _ = window;
     }
 
     fn copy_url(&mut self, cx: &mut Context<Self>) {
@@ -521,6 +557,7 @@ impl SearchView {
             SyncEvent::Removed(ids) => self.remove_repos(&ids, cx),
             SyncEvent::Finished(_) => {
                 self.sync = SyncStatus::Idle;
+                self.last_sync = Some(chrono::Utc::now());
                 self.table
                     .update(cx, |state, _| state.delegate_mut().set_loading(false));
                 self.filters.update(cx, |panel, cx| panel.reload(cx));
@@ -536,19 +573,35 @@ impl SearchView {
 
     // ------------------------------------------------------------ persistence
 
-    fn restore_column_widths(&mut self, cx: &mut Context<Self>) {
+    /// Load the interface state that has to survive a restart.
+    fn restore_persisted_state(&mut self, cx: &mut Context<Self>) {
         let store = Backend::global(cx).store();
-        let rx = Backend::global(cx).spawn(async move { store.get_state(KEY_COLUMN_WIDTHS).await });
+        let rx = Backend::global(cx).spawn(async move {
+            (
+                store.get_state(KEY_COLUMN_WIDTHS).await.ok().flatten(),
+                store
+                    .get_state(starlet_store::KEY_LAST_SYNC)
+                    .await
+                    .ok()
+                    .flatten(),
+            )
+        });
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(raw))) = rx.await else { return };
-            let Ok(widths) = serde_json::from_str::<Vec<f32>>(&raw) else {
+            let Ok((widths, last_sync)) = rx.await else {
                 return;
             };
             let _ = this.update(cx, |this, cx| {
-                this.table.update(cx, |state, cx| {
-                    state.delegate_mut().set_column_widths(&widths);
-                    state.refresh(cx);
-                });
+                this.last_sync = starlet_store::parse_ts(last_sync.as_deref());
+                if let Some(widths) = widths
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<f32>>(raw).ok())
+                {
+                    this.table.update(cx, |state, cx| {
+                        state.delegate_mut().set_column_widths(&widths);
+                        state.refresh(cx);
+                    });
+                }
+                cx.notify();
             });
         })
         .detach();
@@ -644,6 +697,14 @@ impl SearchView {
             window.close_dialog(cx);
             return;
         }
+        // On the sign-in screen Escape declines the offer, which only means
+        // something when there is already a mirror to search.
+        if self.shows_welcome(cx) {
+            if !self.repos.is_empty() {
+                self.dismiss_welcome(window, cx);
+            }
+            return;
+        }
         if !self.input.read(cx).value().is_empty() {
             self.input
                 .update(cx, |state, cx| state.set_value("", window, cx));
@@ -653,7 +714,9 @@ impl SearchView {
     }
 
     fn toggle_sidebar(&mut self, _: &ToggleSidebar, _: &mut Window, cx: &mut Context<Self>) {
-        self.sidebar_open = !self.sidebar_open;
+        // An explicit toggle pins the sidebar for the rest of the session; the
+        // query stops deciding for someone who has already decided.
+        self.sidebar_choice = Some(!self.is_sidebar_open());
         cx.notify();
     }
 
@@ -706,8 +769,19 @@ impl SearchView {
     }
 
     /// Whether the filter sidebar is showing.
+    /// Leave the welcome screen and search the local mirror.
+    pub fn dismiss_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.welcome_dismissed {
+            return;
+        }
+        self.welcome_dismissed = true;
+        self.input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Whether the filter sidebar is showing.
     pub fn is_sidebar_open(&self) -> bool {
-        self.sidebar_open
+        self.sidebar_choice.unwrap_or(!self.is_home())
     }
 
     /// How many rows the table is currently showing.
@@ -726,8 +800,12 @@ impl SearchView {
 
     // ---------------------------------------------------------------- render
 
-    fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_toolbar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let signed_in = Session::is_signed_in(cx);
+        // While the welcome panel is up it owns the sign-in decision; a second
+        // primary button in the toolbar would split one choice across two
+        // places.
+        let offer_sign_in = !signed_in && !self.shows_welcome(cx);
         let login = Session::global(cx)
             .viewer
             .as_ref()
@@ -749,7 +827,7 @@ impl SearchView {
                         Button::new("toggle-sidebar")
                             .ghost()
                             .xsmall()
-                            .icon(if self.sidebar_open {
+                            .icon(if self.is_sidebar_open() {
                                 IconName::PanelLeftClose
                             } else {
                                 IconName::PanelLeftOpen
@@ -764,15 +842,27 @@ impl SearchView {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(
-                        Button::new("command-palette")
-                            .ghost()
-                            .xsmall()
-                            .label(actions::command_palette_shortcut())
-                            .tooltip("Commands")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_palette(&ToggleCommandPalette, window, cx)
-                            })),
+                    // The chord is read back out of the keymap rather than
+                    // written down, so the label cannot drift from the binding
+                    // and each platform renders its own notation.
+                    .when_some(
+                        Kbd::binding_for_action(
+                            &ToggleCommandPalette,
+                            Some(actions::CONTEXT),
+                            window,
+                        ),
+                        |this, kbd| {
+                            this.child(
+                                Button::new("command-palette")
+                                    .ghost()
+                                    .xsmall()
+                                    .tooltip("Commands")
+                                    .child(kbd)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_palette(&ToggleCommandPalette, window, cx)
+                                    })),
+                            )
+                        },
                     )
                     .child(
                         Button::new("settings")
@@ -797,7 +887,7 @@ impl SearchView {
                                 })),
                         )
                     })
-                    .when(!signed_in, |this| {
+                    .when(offer_sign_in, |this| {
                         this.child(
                             Button::new("sign-in")
                                 .primary()
@@ -809,32 +899,45 @@ impl SearchView {
             )
     }
 
+    /// The status line.
+    ///
+    /// Reports what the sync engine is doing, and otherwise when it last
+    /// succeeded. It deliberately never shows a repository count: a number
+    /// nobody asked for is not status, and a corpus size in the chrome reads
+    /// as a claim about the product rather than a fact about the user's data.
     fn render_sync_status(&self, cx: &App) -> impl IntoElement {
-        let (text, muted) = match &self.sync {
-            SyncStatus::Idle => (
-                SharedString::from(format!("{} repositories", self.repos.len())),
-                true,
-            ),
+        let status = match &self.sync {
             SyncStatus::Running { phase, done, total } => {
                 let progress = match total {
                     Some(total) => format!("{done}/{total}"),
                     None => format!("{done}"),
                 };
-                (
+                Some((
                     SharedString::from(format!("{} {progress}", phase.label())),
                     true,
-                )
+                ))
             }
-            SyncStatus::Failed(message) => (SharedString::from(message.clone()), false),
+            SyncStatus::Failed(message) => Some((SharedString::from(message.clone()), false)),
+            SyncStatus::Idle => self.last_sync.map(|at| {
+                (
+                    SharedString::from(format!(
+                        "Synced {}",
+                        format::relative_time(Some(at), chrono::Utc::now())
+                    )),
+                    true,
+                )
+            }),
         };
-        div()
-            .text_xs()
-            .text_color(if muted {
-                cx.theme().muted_foreground
-            } else {
-                cx.theme().danger
-            })
-            .child(text)
+
+        div().when_some(status, |this, (text, muted)| {
+            this.text_xs()
+                .text_color(if muted {
+                    cx.theme().muted_foreground
+                } else {
+                    cx.theme().danger
+                })
+                .child(text)
+        })
     }
 
     fn render_search_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -855,17 +958,55 @@ impl SearchView {
             )
     }
 
-    fn render_home_hint(&self, cx: &App) -> impl IntoElement {
+    /// The signed-out canvas.
+    ///
+    /// One decision, one primary action. The offline escape hatch only appears
+    /// when there is actually something to search, and stays quiet because it
+    /// is the exception, not the path most people want.
+    fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_local_data = !self.repos.is_empty();
         v_flex()
             .items_center()
-            .gap_1()
+            .gap_6()
+            .max_w(px(420.))
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_4()
+                    .child(crate::brand::mark(crate::brand::HERO).text_color(cx.theme().foreground))
+                    .child(div().text_2xl().child("Starlet"))
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Search your GitHub stars, offline and instantly."),
+                    ),
+            )
+            .child(
+                Button::new("welcome-sign-in")
+                    .primary()
+                    .icon(IconName::GitHub)
+                    .label("Sign in with GitHub")
+                    .on_click(|_, window, cx| SignInFlow::start(window, cx)),
+            )
+            .when(has_local_data, |this| {
+                this.child(
+                    Button::new("welcome-offline")
+                        .ghost()
+                        .xsmall()
+                        .label("Search offline")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.dismiss_welcome(window, cx)),
+                        ),
+                )
+            })
+    }
+
+    fn render_home_hint(&self, cx: &App) -> impl IntoElement {
+        div()
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child("Type to search. Try lang:rust, stars:>1000, tag:cli")
-            .child(SharedString::from(format!(
-                "{} repositories indexed",
-                self.repos.len()
-            )))
     }
 
     fn render_results(&self) -> impl IntoElement {
@@ -874,7 +1015,9 @@ impl SearchView {
             .min_h_0()
             .w_full()
             .gap_0()
-            .when(self.sidebar_open, |this| this.child(self.filters.clone()))
+            .when(self.is_sidebar_open(), |this| {
+                this.child(self.filters.clone())
+            })
             .child(
                 div()
                     // Space and Enter mean something different here than they
@@ -906,7 +1049,10 @@ impl EventEmitter<RepoDataChanged> for SearchView {}
 
 impl Render for SearchView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let home = self.is_home();
+        let welcome = self.shows_welcome(cx);
+        // The welcome screen is centred like home, so the layout spacer must
+        // treat it as home even though there is no query field to dock.
+        let home = welcome || self.is_home();
         let target_grow = if home { 1.0 } else { 0.0 };
         let from = self.hero_grow_from;
         let generation = self.layout_generation;
@@ -937,7 +1083,7 @@ impl Render for SearchView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .text_sm()
-            .child(self.render_toolbar(cx))
+            .child(self.render_toolbar(window, cx))
             .child(
                 v_flex()
                     .flex_1()
@@ -967,8 +1113,11 @@ impl Render for SearchView {
                             .items_center()
                             .gap_3()
                             .py_3()
-                            .child(self.render_search_field(cx))
-                            .when(home, |this| this.child(self.render_home_hint(cx))),
+                            .when(welcome, |this| this.child(self.render_welcome(cx)))
+                            .when(!welcome, |this| {
+                                this.child(self.render_search_field(cx))
+                                    .when(home, |this| this.child(self.render_home_hint(cx)))
+                            }),
                     )
                     .when(!home, |this| this.child(self.render_results()))
                     .when(home, |this| {

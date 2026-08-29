@@ -9,6 +9,7 @@
 pub mod actions;
 pub mod analyze;
 pub mod assets;
+pub mod brand;
 pub mod detail;
 pub mod filters;
 pub mod format;

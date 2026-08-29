@@ -11,6 +11,7 @@ use gpui::{
 };
 use gpui_component::{
     ActiveTheme as _, IndexPath, WindowExt as _, h_flex,
+    kbd::Kbd,
     list::{List, ListDelegate, ListItem, ListState},
     v_flex,
 };
@@ -59,13 +60,24 @@ impl Command {
         }
     }
 
-    fn hint(&self) -> Option<SharedString> {
-        use crate::actions::secondary_shortcut;
+    /// The query text a filter command appends, shown so the palette teaches
+    /// the query language instead of hiding it.
+    fn query_hint(&self) -> Option<SharedString> {
         match self {
             Command::Filter { query, .. } => Some(SharedString::from(*query)),
-            Command::Sync => Some(secondary_shortcut("r").into()),
-            Command::Settings => Some(secondary_shortcut(",").into()),
-            Command::ToggleSidebar => Some(secondary_shortcut("b").into()),
+            _ => None,
+        }
+    }
+
+    /// The action whose key binding belongs beside this row.
+    ///
+    /// Returning the action rather than a formatted string means the palette
+    /// shows whatever is actually bound on this platform.
+    fn bound_action(&self) -> Option<Box<dyn gpui::Action>> {
+        match self {
+            Command::Sync => Some(Box::new(crate::actions::SyncNow)),
+            Command::Settings => Some(Box::new(crate::actions::OpenSettings)),
+            Command::ToggleSidebar => Some(Box::new(crate::actions::ToggleSidebar)),
             _ => None,
         }
     }
@@ -167,12 +179,20 @@ impl ListDelegate for CommandDelegate {
     fn render_item(
         &mut self,
         ix: IndexPath,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
         let command = self.matched.get(ix.row)?;
         let selected = self.selected == Some(ix);
-        let hint = command.hint();
+        let query_hint = command.query_hint();
+        // Read the chord back out of the keymap so a row can never advertise a
+        // shortcut the platform does not actually bind.
+        let kbd = command
+            .bound_action()
+            .and_then(|action| {
+                Kbd::binding_for_action(action.as_ref(), Some(crate::actions::CONTEXT), window)
+            })
+            .map(|kbd| kbd.appearance(false));
         Some(
             ListItem::new(("command", ix.row)).selected(selected).child(
                 h_flex()
@@ -194,13 +214,21 @@ impl ListDelegate for CommandDelegate {
                             )
                             .child(command.label()),
                     )
-                    .when_some(hint, |this, hint| {
+                    .when_some(query_hint, |this, hint| {
                         this.child(
                             div()
                                 .text_xs()
                                 .font_family(cx.theme().mono_font_family.clone())
                                 .text_color(cx.theme().muted_foreground)
                                 .child(hint),
+                        )
+                    })
+                    .when_some(kbd, |this, kbd| {
+                        this.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(kbd),
                         )
                     }),
             ),
