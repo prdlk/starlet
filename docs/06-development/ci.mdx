@@ -157,13 +157,12 @@ tip commit's date.
 `package.json` fails the build rather than silently resolving something else.
 
   </Step>
-  <Step title="Four gates, cheapest first">
+  <Step title="Three gates, cheapest first">
 
 ```yaml
 - run: bunx blume check
 - run: bunx blume validate --strict
 - run: bunx blume build
-- run: bunx blume audit
 ```
 
 | Gate | Catches |
@@ -171,20 +170,37 @@ tip commit's date.
 | `blume check` | Type errors in `blume.config.ts` and any authored `.astro` page. Fails on a config typo before the slow render starts. |
 | `blume validate --strict` | Broken internal links and missing heading anchors. `--strict` promotes warnings — a dead anchor is the failure mode that most easily survives a green build. |
 | `blume build` | Frontmatter validation (an unknown key is an error), MDX compile errors, and the render itself. |
-| `blume audit` | Reads the rendered HTML in `dist/` for SEO and site-health problems. Fails on errors; advisory warnings stay in the log. |
+
+`blume audit` is deliberately **not** a CI step. It reports SEO and
+site-health advice over the rendered HTML, and every finding it currently
+raises is advisory — long ADR titles, which are the verbatim decision
+statements and are meant to stay that way. Run it by hand after a build when
+you want the report:
+
+```sh
+bunx blume build && bunx blume audit
+```
 
   </Step>
   <Step title="Upload the artifact">
 
 `actions/upload-pages-artifact@v3` with `path: dist`, gated on
-`github.event_name != 'pull_request'` — a PR stops at the four gates.
+`github.event_name != 'pull_request'` — a PR stops at the three gates.
 
   </Step>
 </Steps>
 
-`BLUME_RUNTIME_DIR: .blume-verify` is set workflow-wide so every command uses the
-isolated runtime. It costs nothing in CI and means the workflow and a local
-`blume dev` session can never contend over the same generated Astro project.
+::::danger[The CI build must not be isolated]
+It is tempting to set `BLUME_RUNTIME_DIR: .blume-verify` workflow-wide so CI can
+never collide with a local `blume dev`. Don't. An isolated build relocates the
+output to `.blume-verify/dist`, which the `path: dist` upload would not find —
+and, worse, it **skips the deploy post-steps**: the search index, `sitemap.xml`,
+`robots.txt`, and `llms.txt`/`llms-full.txt` are never generated. The site would
+deploy looking correct and quietly ship with search broken.
+
+Isolation exists to protect a *developer's* running dev server. A CI runner has
+none, so the workflow runs a plain `bunx blume build`.
+::::
 
 ### `deploy` job
 

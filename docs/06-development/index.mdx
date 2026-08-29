@@ -95,7 +95,9 @@ bunx blume build --isolated   # thorough: full production render
 ```
 
 Setting `BLUME_RUNTIME_DIR=.blume-verify` makes plain `build`/`check` isolate
-without the flag. The CI workflow does exactly that.
+without the flag — useful in an agent's shell. CI deliberately does *not* set
+it: an isolated build skips the search index and the sitemap. See
+[CI and docs](/development/ci).
 ::::
 
 ### Upkeep

@@ -70,9 +70,17 @@ the fallback `"starlet=info,warn"` and stderr as the writer
 
 Documentation-site only — it has nothing to do with the Rust binary. Blume
 generates an Astro project on disk to build the site; `BLUME_RUNTIME_DIR` moves
-that generated runtime somewhere else, so a build cannot corrupt the runtime a
-dev server is already using. The docs CI workflow sets it to `.blume-verify`
-for exactly that reason (`.github/workflows/docs.yml:41`).
+that generated runtime somewhere else, so a verification build cannot corrupt
+the runtime a `blume dev` server is already using. Set it locally when you want
+to build or type-check while the dev server stays up:
+
+```sh
+BLUME_RUNTIME_DIR=.blume-verify bunx blume build
+```
+
+The docs CI workflow deliberately does **not** set it: an isolated build writes
+to `.blume-verify/dist` and skips the search index, sitemap, and `llms.txt`.
+See [CI and docs](/development/ci).
 
 ## Database paths
 
