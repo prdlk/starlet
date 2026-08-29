@@ -1,0 +1,22 @@
+[package]
+name = "starlet-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "starlet"
+path = "src/main.rs"
+
+[dependencies]
+starlet-store.workspace = true
+starlet-sync.workspace = true
+starlet-ui.workspace = true
+anyhow.workspace = true
+gpui.workspace = true
+gpui-component.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
