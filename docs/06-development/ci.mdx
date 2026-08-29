@@ -11,10 +11,37 @@ docs; a docs-only commit does not spend three platforms of cold Rust builds.
 
 ## `ci.yml` — the Rust workflow
 
-Triggers on pushes to `main` and on every pull request. Concurrency group
-`ci-${{ github.ref }}` with `cancel-in-progress: true` — a force-push or a new
-commit makes the in-flight run worthless, and cancelling it is cheaper than
-paying for three platforms twice.
+::::danger[Automatic triggers are currently disabled]
+`.github/workflows/ci.yml:3-7` presently reads:
+
+```yaml .github/workflows/ci.yml
+on:
+  # push:
+  # branches: [main]
+  # pull_request:
+  workflow_dispatch:
+```
+
+So the Rust suite runs **only** when someone clicks *Run workflow*. Nothing
+gates a push or a pull request. Everything else in the file — the
+`cancel-in-progress` concurrency group keyed on `github.ref`, the
+`fail-fast: false` matrix reasoning — presupposes the push and pull-request
+triggers, so this is a pause rather than a design. Restore it by uncommenting
+those three lines:
+
+```yaml .github/workflows/ci.yml
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+```
+::::
+
+With the triggers restored, the workflow runs on pushes to `main` and on every
+pull request. Concurrency group `ci-${{ github.ref }}` with
+`cancel-in-progress: true` — a force-push or a new commit makes the in-flight run
+worthless, and cancelling it is cheaper than paying for three platforms twice.
 
 ### `lint` job
 

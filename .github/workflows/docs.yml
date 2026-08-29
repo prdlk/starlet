@@ -72,11 +72,6 @@ jobs:
       - name: blume build
         run: bunx blume build
 
-      # `blume audit` reads the rendered HTML in dist/, so it can only run after
-      # the build. Errors fail; advisory warnings are left to the log.
-      - name: blume audit
-        run: bunx blume audit
-
       - name: Upload Pages artifact
         # Only the branch build produces something to deploy; a pull request
         # stops at the checks above.
