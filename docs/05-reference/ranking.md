@@ -1,4 +1,10 @@
-# How Starlet ranks results
+---
+title: Ranking
+description: How Starlet scores and orders search results — the fuzzy name matcher, the BM25 prose index, the blend, and the two-stage pipeline.
+sidebar:
+  label: Ranking
+  icon: trending-up
+---
 
 Starlet answers every keystroke from memory and SQLite. Nothing on the search
 path touches the network.

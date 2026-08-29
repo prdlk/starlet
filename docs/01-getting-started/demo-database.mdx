@@ -1,0 +1,83 @@
+---
+title: Demo database
+description: Seed 5 000 deterministic synthetic stars and launch against them — no GitHub account, no network, reproducible timings.
+sidebar:
+  label: Demo database
+  icon: database
+---
+
+The `seed` example fills a throwaway database with synthetic stars, writing
+through the *real* DAO so FTS triggers and topic mirroring behave exactly as they
+do in production. This is the fastest way to work on search, ranking, or the UI.
+
+```sh
+just demo
+```
+
+That is `seed` followed by a launch:
+
+```sh
+cargo run -q -p starlet-store --example seed -- /tmp/starlet-demo.db 5000
+STARLET_DB=/tmp/starlet-demo.db cargo run -p starlet-app
+```
+
+Clean up with `just demo-clean`, which removes the database and its `-shm` /
+`-wal` sidecars.
+
+## The seed CLI
+
+```sh
+cargo run -p starlet-store --example seed -- <db-path> <count>
+```
+
+Both arguments are positional and optional (`crates/store/examples/seed.rs:165-170`):
+
+| Argument | Default | Notes |
+| --- | --- | --- |
+| `<db-path>` | `default_database_path()` | Omitting it seeds your **real** database. |
+| `<count>` | `5000` | Parsed with `.parse().ok()`, so an unparseable value silently falls back to 5 000. |
+
+There are no flags and no `--help`.
+
+::::danger[The path argument is not optional in practice]
+`cargo run -p starlet-store --example seed` with no arguments writes 5 000
+synthetic repositories into `~/.local/share/starlet/starlet.db`, on top of your
+real stars. Always pass a path.
+::::
+
+## What it produces
+
+- **Deterministic.** The PRNG is a xorshift64\* seeded with the constant
+  `0x05EE_D57A_21E7` (`crates/store/examples/seed.rs:173`, xorshift64\* at
+  `crates/store/examples/seed.rs:141-161`), so timing runs
+  and screenshots are reproducible across machines.
+- **Ids are `1..=count`**, so you can address a specific row by hand.
+- **A realistic vocabulary**: 35 owners, 26 nouns, 14 adjectives, 16 languages,
+  16 topics. Roughly 1 in 20 archived, 1 in 12 a fork, every 7th repo gets one
+  contributor.
+- **AI tags and groups.** 2–4 AI tags are attached to the first
+  `min(count, 600)` repositories, and four AI groups are created and linked by
+  `full_name` — so the facet sidebar and the group filters have something to
+  show without running a model.
+- **`sync.initial_done = "1"`.** The seed sets
+  `KEY_INITIAL_SYNC_DONE` so the app does not think it needs a first sync.
+
+Rows are inserted in 500-row chunks; the example prints
+`inserted {count} repositories in {duration:?}` and then
+`database ready at {path}`.
+
+## Using it for benchmarks
+
+The two performance suites build their own 5 000-repo corpora rather than
+reading a seeded file, so they need no setup:
+
+```sh
+just bench
+```
+
+That runs `crates/core/tests/ranking_performance.rs` and
+`crates/store/tests/search_performance.rs` in the release profile with
+`--nocapture`, so the measured numbers are printed. The budgets are set well
+above the reference measurements on purpose — they exist to catch a missing
+index or an accidental N+1, not to police milliseconds on a slow CI runner. See
+[Testing](/development/testing).

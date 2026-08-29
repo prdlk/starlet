@@ -1,0 +1,546 @@
+---
+title: ai
+description: The optional BYOK layer — one provider trait, three backends, two prompts, a tolerant JSON extractor, an upper-bound cost model, and a batched run loop.
+sidebar:
+  label: ai
+  icon: sparkles
+---
+
+`starlet-ai` (lib `starlet_ai`) is the only optional crate in the workspace: the
+product works with it switched off, and it never runs unless the user clicks
+Analyze. It is built I/O-at-the-edges. The **pure core** is `prompt` (the two
+system prompts and the retry suffix), `parse` (tolerant JSON extraction plus
+value sanitisation) and `cost` (an upper-bound token and price model). The
+**impure edge** is `client` (a private `ApiKey` wrapper, status handling,
+redaction, and the one-retry combinator) plus three `AiProvider` implementations
+that differ only in transport.
+
+Dependencies point downward to `starlet-core` only — `RepoSummary`, `RepoTag`,
+`Group`, `TagSource`. Nothing here knows that SQLite or a window exists.
+Persistence is the caller's job: `crates/ui/src/analyze.rs` is the sole consumer
+of the run loop and the only thing that writes to the store.
+
+::::info[The secrets contract]
+Three rules, stated in the module doc at `crates/ai/src/lib.rs:1-23` and enforced
+in `crates/ai/src/client.rs`:
+
+1. `Debug` on a key prints `ApiKey(redacted)` (or `ApiKey(unset)`) — the
+   hand-written impl at `crates/ai/src/client.rs:39-45` exists so a `{:?}` in a
+   `tracing` call can never leak.
+2. A key is **never** placed in a URL. It travels as a header only —
+   `Authorization: Bearer` for OpenAI, `x-api-key` for Anthropic, an optional
+   bearer for a proxied Ollama.
+3. An error body is truncated to `MAX_ERROR_BODY = 512`
+   (`crates/ai/src/client.rs:51`) **after** the literal key has been replaced by
+   `[redacted]` (`crates/ai/src/client.rs:69`), in that order, because gateways
+   routinely echo the Authorization header back inside a 401 body.
+::::
+
+## Modules
+
+| Module | Visibility | Contents |
+| --- | --- | --- |
+| `provider` | public | `AiProvider`, `AiError`, `RepoTags`, `RepoWithTags`, `CostEstimate`, `Result` |
+| `client` | **private** (`crates/ai/src/lib.rs:34`) | `ApiKey`, `body_or_status`, `parse_with_one_retry`, `envelope_field` |
+| `prompt` | public | `TAG_SYSTEM`, `GROUP_SYSTEM`, `RETRY_SUFFIX`, `tag_user`, `group_user` |
+| `parse` | public | `parse_tags`, `parse_groups` and the balanced-brace extractor |
+| `cost` | public | `Price`, the two price tables, the approximation constants |
+| `openai` / `anthropic` / `ollama` | public | one backend each: `ID`, `DEFAULT_MODEL`, `DEFAULT_BASE_URL`, the struct |
+| `analysis` | public | `BATCH_SIZE`, `AiEvent`, `analyze` |
+
+The crate root adds two items that exist purely so the settings UI can be written
+against strings instead of types:
+
+```rust crates/ai/src/lib.rs
+pub fn provider_for(
+    id: &str, api_key: impl Into<String>, model: impl Into<String>,
+) -> Option<Box<dyn AiProvider>>            // lib.rs:48
+pub const PROVIDER_IDS: [&str; 3]           // lib.rs:62
+```
+
+`provider_for` matches `openai` / `anthropic` / `ollama` and returns `None` for
+anything else; `PROVIDER_IDS` fixes the ordering the settings dropdown renders.
+
+## The provider trait
+
+```rust crates/ai/src/provider.rs
+#[async_trait]
+pub trait AiProvider: Send + Sync {          // provider.rs:88
+    fn id(&self) -> &'static str;            // provider.rs:93
+    fn model(&self) -> &str;                 // provider.rs:96
+    fn estimate(&self, repos: usize) -> CostEstimate;               // provider.rs:99
+    async fn tag(&self, batch: &[RepoSummary]) -> Result<Vec<RepoTags>>;  // provider.rs:102
+    async fn group(&self, repos: &[RepoWithTags]) -> Result<Vec<Group>>;  // provider.rs:106
+}
+```
+
+Five methods, no more. Implementations are cheap to clone and hold **no per-run
+state**, which is what lets `analyze` borrow one `&dyn AiProvider` for an entire
+library pass.
+
+Two design points that constrain any fourth backend:
+
+- **`group` is deliberately unbatched.** `tag` takes a slice because tagging one
+  repository is independent of tagging the next; clustering is not. A grouper
+  that only ever saw 25 repositories at a time would produce 25-repo-wide groups
+  and no global structure, so `group` is handed the whole library once
+  (`crates/ai/src/provider.rs:106`).
+- **`id()` returns `&'static str` and is frozen.** The same string is the
+  settings key, the suffix of the OS-keychain account, and the match arm in
+  `provider_for` (`crates/ai/src/lib.rs:52-56`). Renaming it silently orphans
+  every stored key.
+
+### Errors
+
+```rust crates/ai/src/provider.rs
+pub type Result<T, E = AiError> = std::result::Result<T, E>;  // provider.rs:14
+pub enum AiError { … }                                        // provider.rs:22
+```
+
+| Variant | Cite | Meaning |
+| --- | --- | --- |
+| `Http(reqwest::Error)` | `provider.rs:25` | transport failure; `#[from]`, never retried |
+| `Status { code: u16, message: String }` | `provider.rs:30` | non-2xx; `message` is redacted then truncated to 512 chars |
+| `Json(serde_json::Error)` | `provider.rs:34` | the **envelope** failed to decode |
+| `MalformedResponse(String)` | `provider.rs:40` | the model's own text failed `parse`; carries a reason, **never the model text** |
+| `MissingKey` | `provider.rs:45` | checked before any request is built |
+| `Cancelled` | `provider.rs:49` | the cancel flag flipped, or the event receiver was dropped |
+
+### Data types
+
+| Type | Cite | Shape |
+| --- | --- | --- |
+| `RepoTags` | `provider.rs:56-58` | `{ full_name: String, tags: Vec<RepoTag> }` — one tagging result |
+| `RepoWithTags` | `provider.rs:64-68` | `{ full_name, description: Option<String>, tags: Vec<String> }` — the grouping input; tag names are flattened and **source-agnostic**, and `description` carries `skip_serializing_if` so absent data costs no tokens |
+| `CostEstimate` | `provider.rs:77-80` | `{ input_tokens: u64, output_tokens: u64, usd: f64 }`, `Copy + Default` |
+
+## The three backends
+
+| | `openai` | `anthropic` | `ollama` |
+| --- | --- | --- | --- |
+| `ID` | `"openai"` (`openai.rs:13`) | `"anthropic"` (`anthropic.rs:13`) | `"ollama"` (`ollama.rs:16`) |
+| `DEFAULT_MODEL` | `gpt-4o-mini` (`:14`) | `claude-3-5-haiku-latest` (`:14`) | `llama3.1` (`:17`) |
+| `DEFAULT_BASE_URL` | `https://api.openai.com` (`:15`) | `https://api.anthropic.com` (`:15`) | `http://localhost:11434` (`:18`) |
+| Endpoint | `POST {base}/v1/chat/completions` (`openai.rs:54`) | `POST {base}/v1/messages` (`anthropic.rs:60`) | `POST {base}/api/chat` (`ollama.rs:54`) |
+| Auth | `Authorization: Bearer <key>` | `x-api-key: <key>` **and** `anthropic-version: 2023-06-01`; no Authorization header | none, or `Authorization: Bearer <key>` when a key is configured (`ollama.rs:70-72`) |
+| JSON mode | native `response_format: {"type":"json_object"}` | **none** — prompt, parser and retry only | top-level `format: "json"` |
+| Reply extraction | `envelope_field(…, "/choices/0/message/content")` | `text_blocks(envelope)` (`anthropic.rs:91`) | `envelope_field(…, "/message/content")` |
+| Key required | yes — `key.require()?` before the request | yes | **no** (`ollama.rs:54`) |
+
+All three share the same shape: `new(api_key, model)` where an empty or
+whitespace-only model falls back to `DEFAULT_MODEL`, `with_base_url(url)` which
+trims a trailing `/` and is the wiremock/reverse-proxy seam
+(`openai.rs:48`, `anthropic.rs:55`, `ollama.rs:49`), and a private `async fn chat`
+that all trait methods route through. Temperature is `0` everywhere.
+
+### OpenAI
+
+The simplest of the three, and the reference implementation for a new backend.
+`chat` (`crates/ai/src/openai.rs:54`) calls `self.key.require()?` first, so a
+keyless run never touches the network, then posts
+`{model, temperature: 0, response_format: {type: "json_object"}, messages: [system, user]}`.
+Native JSON mode does not make the tolerant parser redundant — the model still
+wraps or prefixes often enough that `parse` earns its keep — but it does make the
+retry rare.
+
+### Anthropic
+
+Three differences that are not cosmetic:
+
+- **`anthropic-version: 2023-06-01`** is a pinned private const
+  (`crates/ai/src/anthropic.rs:19`). It is pinned deliberately: a new version that
+  changes the response shape should be a code change with a test, not a silent
+  drift in production.
+- **`MAX_TOKENS: u32 = 8192`** (`crates/ai/src/anthropic.rs:24`) — Anthropic
+  requires the field, and the value matters, because a truncated reply is an
+  unparseable reply, which burns the single retry for nothing.
+- **The system prompt is a top-level field**, not a message with `role: system`.
+  The comment at `crates/ai/src/anthropic.rs:27-29` records that this is precisely
+  why OpenAI and Anthropic cannot share a request builder.
+
+Extraction is not a JSON pointer. `fn text_blocks`
+(`crates/ai/src/anthropic.rs:91`) walks the `content` array and concatenates every
+element whose `type` is `"text"`, **skipping anything else** — notably `thinking`
+blocks, which would otherwise be prepended to the JSON and defeat a naive
+"take `content[0]`". A missing `content` array yields a
+`MalformedResponse` reading *anthropic response has no `content` array*; a
+`content` array with zero text blocks yields *anthropic response contained no
+text blocks*.
+
+There is **no JSON mode on this provider**. The reply format is enforced by three
+things and nothing else: the prompt's final "Reply with one JSON object and
+nothing else", the tolerant parser, and the one retry.
+
+### Ollama
+
+`chat` (`crates/ai/src/ollama.rs:54`) has **no `require()` call**, which makes it
+the only provider that can reach the network without a key — correct, because a
+local Ollama has no auth. The body is
+`{model, stream: false, format: "json", options: {temperature: 0}, messages: [system, user]}`:
+Ollama's JSON mode is the top-level `format` field, and temperature lives under
+`options` rather than beside `model`.
+
+The `key` field (`crates/ai/src/ollama.rs:26`) is normally empty. When it is set,
+it is attached as a bearer token (`crates/ai/src/ollama.rs:70-72`) for the one
+real case — a reverse proxy fronting a remote Ollama. `estimate`
+(`crates/ai/src/ollama.rs:92`) always uses `Price::FREE`, so the USD figure is
+zero while the token counts stay real, which is what lets the dialog still show
+the job's size.
+
+## The retry contract
+
+```rust crates/ai/src/client.rs
+pub(crate) async fn parse_with_one_retry<T, F, Fut>(
+    provider: &'static str,
+    mut send: F,                       // send(retry: bool) -> Fut
+    parse: fn(&str) -> Result<T>,
+) -> Result<T>                         // client.rs:90
+```
+
+Exactly one retry, and only for one reason:
+
+1. `send(false)`, then `parse`. On `Ok`, return.
+2. On a **parse** failure, `tracing::warn!`, then `send(true)` — exactly once —
+   and parse again.
+3. A second parse failure is returned as-is. There is no third attempt and no
+   backoff.
+
+`send(true)` differs from `send(false)` only in that `prompt::with_retry`
+(`crates/ai/src/prompt.rs:70`) appends `RETRY_SUFFIX`
+(`crates/ai/src/prompt.rs:53`) to the **user** message. The system prompt is
+byte-identical on both attempts.
+
+::::warning[Transport and status errors are never retried]
+`body_or_status` (`crates/ai/src/client.rs:57`) propagates through `?`, so a 401,
+a 429 or a dropped connection leaves `parse_with_one_retry` immediately. Retrying
+a 401 just spends another request proving the key is still wrong; retrying a 429
+without a backoff schedule makes the rate limit worse. `envelope_field`
+(`crates/ai/src/client.rs:121`) is in the same category — a response with no text
+at the expected pointer is a **hard** `MalformedResponse`, because a broken
+envelope means the wrong endpoint or the wrong API version, and neither improves
+on a second try. Only the model's own prose is worth asking again for.
+::::
+
+## Prompts
+
+All three providers send byte-identical instructions
+(`crates/ai/src/prompt.rs`). The user message is a plain `serde_json::to_string`
+of the batch (`tag_user`, `crates/ai/src/prompt.rs:60`) or of the whole library
+(`group_user`, `crates/ai/src/prompt.rs:65`).
+
+**`TAG_SYSTEM`** (`crates/ai/src/prompt.rs:16`) asks for, per repository in the
+input array:
+
+- between **3 and 6** topical tags;
+- lowercase kebab-case, one to three words;
+- a tag says what the project *is* or is *for* — never the owner, never the
+  repository name, never popularity, licence, or activity;
+- a per-tag `confidence` in `0..1`;
+- `full_name` echoed back **exactly**, and no invented repositories.
+
+**`GROUP_SYSTEM`** (`crates/ai/src/prompt.rs:32`) asks for:
+
+- between **4 and 20** groups, preferring fewer and larger over many tiny ones;
+- `name` as a short title-case human title;
+- `summary` as one plain sentence saying what the group collects;
+- `members` as `full_name` values copied **exactly** from the input;
+- a repository may appear in more than one group, and leaving one out is
+  preferred to forcing it somewhere it does not belong.
+
+Both close with "Reply with one JSON object and nothing else. No prose, no
+explanation, no markdown code fence." and then show the shape:
+
+```json tagging response
+{"repos":[{"full_name":"owner/name","tags":[{"name":"tag","confidence":0.0}]}]}
+```
+
+```json grouping response
+{"groups":[{"name":"Group Name","summary":"one line","members":["owner/name"]}]}
+```
+
+## Tolerant parsing
+
+The module doc at `crates/ai/src/parse.rs:1-12` states the policy as a split:
+**reject structure, sanitise values**. A reply that is the wrong *shape* is an
+error; a reply that is the right shape with sloppy *contents* is cleaned up.
+
+`pub fn parse_tags(raw: &str) -> Result<Vec<RepoTags>>`
+(`crates/ai/src/parse.rs:28`) and
+`pub fn parse_groups(raw: &str) -> Result<Vec<Group>>`
+(`crates/ai/src/parse.rs:65`) both extract a JSON value, reject a non-object root,
+reject a missing or non-array `repos` / `groups`, and then sanitise entries.
+
+### What the extractor recovers
+
+Everything below falls out of **one** mechanism. `fn extract_json`
+(`crates/ai/src/parse.rs:192`) scans left to right for each `{` or `[`, computes
+its balanced close with `fn balanced_end` (`crates/ai/src/parse.rs:221`), and
+tries `serde_json::from_str` on that slice. A candidate that balances but does
+not decode is skipped and the scan continues, which makes the whole thing
+self-correcting. `balanced_end` tracks `in_string` and `escaped`, so a brace
+inside a string literal never moves the depth counter.
+
+| Recovered | Cite |
+| --- | --- |
+| a markdown code fence labelled `json` | `parse.rs:273` |
+| an unlabelled markdown code fence | `parse.rs:280` |
+| prose before **and** after the object, including a bracketed `[…]` aside that balances but is not JSON | `parse.rs:286` |
+| a `}` inside a string literal — which defeats `rfind('}')` and every naive regex | `parse.rs:295` |
+| backslash escapes and escaped quotes | `parse.rs:304` |
+| unicode and emoji in values | `parse.rs:451` |
+
+### What it deliberately does not recover
+
+Nothing rewrites the text. A candidate either decodes under strict
+`serde_json` or is skipped.
+
+| Not recovered | Why |
+| --- | --- |
+| trailing commas, single quotes, unquoted keys, comments | any non-strict-JSON dialect; repairing one invites repairing all of them |
+| a truncated reply | terminal — the message is `"response contains no complete JSON value (truncated?)"` when an opener was seen, otherwise `"response contains no JSON value"` (`parse.rs:246-250`) |
+| a top-level array | `parse.rs:320` — the first balanced value wins and the root-type check rejects it |
+| the right object nested inside an array | `parse.rs:329` — same reason |
+
+### Value sanitisation
+
+`fn sanitise_tags` (`crates/ai/src/parse.rs:119`) accepts both
+`{"name": …, "confidence": …}` and a bare string, and applies, in order:
+
+| Rule | Cite |
+| --- | --- |
+| a bare string gets `ASSUMED_CONFIDENCE = 0.5` | `parse.rs:19` |
+| items that are neither a string nor an object are skipped | `parse.rs:119` |
+| `confidence.clamp(0.0, 1.0)` with an **explicit NaN guard** mapping to `0.5`, because `f32::clamp` panics on a NaN bound path | `parse.rs:156-161` |
+| names normalised by trim → lowercase → internal whitespace runs collapsed to `-`, so `"Static Site Generator"` and `"static-site-generator"` are the same tag | `parse.rs:170` |
+| an empty normalised name is skipped | `parse.rs:119` |
+| duplicates dropped **after** normalisation, so de-duplication is case-insensitive | `parse.rs:119` |
+| a hard break at `MAX_TAGS_PER_REPO = 6` | `parse.rs:23`, `:163-165` |
+
+A repository whose tags all fell away is silently dropped
+(`crates/ai/src/parse.rs:51-55`); a group with zero surviving members is silently
+dropped (`crates/ai/src/parse.rs:101-103`). Group `summary` defaults to `""` and
+is trimmed; `members` are trimmed, blank-filtered and de-duplicated in order;
+every emitted `Group` carries `source: TagSource::Ai`.
+
+::::danger[A missing name is a hard error, not a drop]
+A missing or blank `full_name` (`parse_tags`) or `name` (`parse_groups`) fails the
+whole call. Everything else about an entry can be salvaged, but a nameless result
+cannot be attributed to a repository, and quietly discarding it would let a model
+that ignored the echo rule look like a model that simply had nothing to say.
+::::
+
+## Cost
+
+The estimate is an intentional **upper bound**, not a quote — the module doc at
+`crates/ai/src/cost.rs:1-25` says so, and both approximations are pessimistic on
+purpose so the number the user agrees to is never exceeded.
+
+| Constant | Value | Cite |
+| --- | --- | --- |
+| `CHARS_PER_TOKEN` | 4 | `cost.rs:42` |
+| `TAG_INPUT_CHARS_PER_REPO` | 320 | `cost.rs:46` |
+| `GROUP_INPUT_CHARS_PER_REPO` | 200 | `cost.rs:50` |
+| `TAG_OUTPUT_TOKENS_PER_REPO` | 48 | `cost.rs:53` |
+| `GROUP_OUTPUT_TOKENS_PER_REPO` | 12 | `cost.rs:56` |
+
+`fn tokens(repos) -> (u64, u64)` (`crates/ai/src/cost.rs:115`) short-circuits an
+empty library to `(0, 0)` and otherwise computes:
+
+```text crates/ai/src/cost.rs:115
+batches = ceil(repos / BATCH_SIZE)            // BATCH_SIZE = 25
+input   = batches * ceil(len(TAG_SYSTEM) / 4)
+        + ceil(len(GROUP_SYSTEM) / 4)
+        + repos * (320 + 200) / 4
+output  = repos * (48 + 12)
+```
+
+The tag system prompt is counted once **per batch** because every batch resends
+it; the group system prompt is counted once, because grouping happens once.
+
+`pub(crate) fn estimate(repos, price)` (`crates/ai/src/cost.rs:134`) is then
+
+$$
+\text{usd} = \frac{\text{input tokens} \times p_{\text{in}} + \text{output tokens} \times p_{\text{out}}}{10^{6}}
+$$
+
+### Price tables
+
+`pub struct Price { pub input_per_m: f64, pub output_per_m: f64 }`
+(`crates/ai/src/cost.rs:29-31`), with `Price::FREE` at `crates/ai/src/cost.rs:35`.
+All figures are USD per million tokens.
+
+`OPENAI_PRICES` (`crates/ai/src/cost.rs:61`), in table order:
+
+| Prefix | Input | Output |
+| --- | --- | --- |
+| `gpt-4.1-nano` | 0.10 | 0.40 |
+| `gpt-4.1-mini` | 0.40 | 1.60 |
+| `gpt-4.1` | 2.00 | 8.00 |
+| `gpt-4o-mini` | 0.15 | 0.60 |
+| `gpt-4o` | 2.50 | 10.00 |
+| `o4-mini` | 1.10 | 4.40 |
+| `o3-mini` | 1.10 | 4.40 |
+| `o3` | 2.00 | 8.00 |
+| *fallback* (`cost.rs:73`) | 2.50 | 10.00 |
+
+`ANTHROPIC_PRICES` (`crates/ai/src/cost.rs:76`), in table order:
+
+| Prefix | Input | Output |
+| --- | --- | --- |
+| `claude-3-5-haiku` | 0.80 | 4.00 |
+| `claude-3-haiku` | 0.25 | 1.25 |
+| `claude-haiku-4` | 1.00 | 5.00 |
+| `claude-3-5-sonnet` | 3.00 | 15.00 |
+| `claude-3-7-sonnet` | 3.00 | 15.00 |
+| `claude-sonnet-4` | 3.00 | 15.00 |
+| `claude-3-opus` | 15.00 | 75.00 |
+| `claude-opus-4` | 15.00 | 75.00 |
+| *fallback* (`cost.rs:88`) | 3.00 | 15.00 |
+
+An unknown model gets the fallback, which is the most expensive plausible model
+on that platform — again, so the estimate is never an under-count.
+
+::::warning[Table order is load-bearing]
+`fn lookup` (`crates/ai/src/cost.rs:105`) lowercases the model name and takes the
+**first prefix that matches**. `gpt-4o-mini` therefore *must* appear before
+`gpt-4o`, or every mini run is priced at 2.50/10.00 instead of 0.15/0.60. Adding a
+row means inserting it at the most-specific position, not appending it. The test
+at `crates/ai/src/cost.rs:156` exists for exactly this.
+::::
+
+For the operator-facing view — which provider to pick, where the key is stored,
+what the dialog shows before you confirm — see
+[AI providers](/getting-started/ai-providers).
+
+## The run loop
+
+```rust crates/ai/src/analysis.rs
+pub const BATCH_SIZE: usize = 25;            // analysis.rs:21
+
+pub async fn analyze(
+    provider: &dyn AiProvider,
+    repos: &[RepoSummary],
+    tags_by_repo: &HashMap<String, Vec<String>>,
+    events: UnboundedSender<AiEvent>,
+    cancel: Arc<AtomicBool>,
+) -> Result<()>                              // analysis.rs:57
+```
+
+`AiEvent` (`crates/ai/src/analysis.rs:25`):
+
+| Variant | Meaning |
+| --- | --- |
+| `Started { batches }` | emitted before any request; sizes the progress bar |
+| `Progress { done, total }` | one per batch, after the call resolves |
+| `Tagged(Vec<RepoTags>)` | one per **successful** batch, ready to persist immediately |
+| `Grouped(Vec<Group>)` | the single grouping pass succeeded |
+| `Finished { repos, cost }` | terminal success |
+| `Failed(String)` | a **recoverable** notification, not a terminal state |
+| `Cancelled` | terminal |
+
+The sequence:
+
+1. Emit `Started { batches }`. An empty library emits
+   `Finished { repos: 0, cost: 0.0 }` and returns `Ok`, without touching the
+   provider.
+2. For each chunk of 25: check `cancel` **before** the call, then
+   `provider.tag(batch)`. On `Ok`, push and emit `Tagged`. On `Err`,
+   `tracing::warn!`, `failures += 1`, emit `Failed(err.to_string())`, and keep the
+   error as `last_error`.
+3. `done += batch.len()` **unconditionally**, then emit `Progress`, so the bar
+   always reaches `total` whether or not the batch succeeded.
+4. If `failures == batches.len()`, return `last_error`
+   (`crates/ai/src/analysis.rs:117-121`).
+5. Re-check `cancel` (`crates/ai/src/analysis.rs:123`), build the grouping input
+   via `merge_tags`, and call `provider.group` once. On `Ok`, emit `Grouped`. On
+   `Err`, warn, emit `Failed`, and **return `Err`**.
+6. Emit `Finished { repos: tagged.len(), cost: provider.estimate(total).usd }`.
+
+Three behaviours worth internalising before you change any of it:
+
+- **Cancellation is checked before each call, never during one.** An in-flight
+  request is already paid for, so tearing it down saves nothing and loses the
+  result. `fn cancelled` (`crates/ai/src/analysis.rs:194`) is a `Relaxed` load —
+  the flag is a hint whose worst case is one extra batch.
+- **A failing group pass returns `Err` but keeps the tags.** They were already
+  emitted, and the UI already persisted them; only the sidebar is missing. One
+  failing *tag* batch, by contrast, does not abort the run — only an
+  all-failing run is an error.
+- **`fn emit` maps a dropped receiver to `AiError::Cancelled`**
+  (`crates/ai/src/analysis.rs:200`). Closing the window drops the receiver, which
+  stops the run at the next event rather than letting it grind on invisibly.
+
+`fn merge_tags` (`crates/ai/src/analysis.rs:157`) builds the `RepoWithTags` list.
+It unions the store-known tags — GitHub topics and user tags — **first**, then the
+freshly produced AI tag names, trimming and de-duplicating. Order is the only
+priority hint the model gets, so it is not incidental. Every repository reaches
+the grouper, including ones that came back untagged.
+
+## Tests
+
+`crates/ai/tests/analysis.rs` — orchestration, no network. A hand-written `Stub`
+provider (`tests/analysis.rs:14-93`) records batch sizes, can be told to fail
+chosen batch indices, can flip the cancel flag after serving batch *N*, and
+captures the `group` input. Every case is `#[tokio::test]` plus a
+`tokio::sync::mpsc::unbounded_channel` drained with `try_recv`.
+
+| Case | Cite |
+| --- | --- |
+| 60 repos chunk into `[25, 25, 10]`, with the `Started`/`Tagged`/`Progress`/`Grouped`/`Finished` ordering and cost `60 × 0.01` | `:139` |
+| cancel after batch 0 ⇒ `Err(Cancelled)`, one batch attempted, the in-flight `Tagged` still delivered, no `Grouped` | `:180` |
+| cancel set before the run ⇒ exactly `[Started, Cancelled]`, provider never called | `:203` |
+| one failing batch of three ⇒ run is still `Ok`, `Tagged` = `[25, 10]`, exactly one `Failed`, `Progress` reaches 60/60, `Finished { repos: 35 }` | `:215` |
+| all batches failing ⇒ `Err(MalformedResponse)` and no `Finished` | `:250` |
+| grouping sees existing tags first then AI tags de-duplicated; unknown store keys ignored; description forwarded | `:265` |
+| a failing group pass keeps the emitted tags but returns `Err`, with `Failed` last | `:296` |
+| an empty library finishes without calling the provider | `:307` |
+
+`crates/ai/tests/providers.rs` — wire level, through the `with_base_url` seam
+against `wiremock`. `GOOD` (`:14`) is a reply carrying `"Rust"` at confidence
+`1.4` so that normalisation and clamping are *provable* rather than assumed;
+`GARBAGE` (`:17`) is a model apology. `struct Sequence` (`:21`) implements
+`wiremock::Respond` to script per-call bodies without depending on mock ordering,
+which is what makes "exactly one retry" testable. `assert_good` (`:74`) asserts
+names `["rust", "cli"]`, confidence clamped to `1.0`, and every source
+`TagSource::Ai`.
+
+| Provider | Case | Cite |
+| --- | --- | --- |
+| OpenAI | documented request: path, `Bearer`, model, temperature 0, `response_format.type == "json_object"`, system+user roles | `:96` |
+| OpenAI | exactly one retry, and the retry body contains "could not be parsed" | `:129` |
+| OpenAI | gives up after the second bad reply — exactly 2 requests | `:150` |
+| OpenAI | 401 ⇒ `AiError::Status`, key redacted, **no retry** | `:168` |
+| OpenAI | a missing key never reaches the network | `:192` |
+| Anthropic | documented request: `x-api-key`, `anthropic-version: 2023-06-01`, **absence** of Authorization, `max_tokens > 0`, system as a top-level field, one user message | `:205` |
+| Anthropic | multiple `text` blocks joined while a `thinking` block is skipped | `:239` |
+| Anthropic | one retry, then fail | `:261` |
+| Ollama | `/api/chat`, no Authorization when keyless, `stream: false`, `format: "json"`, free estimate | `:288` |
+| Ollama | one retry, then fail | `:317` |
+| Ollama | bearer token forwarded when configured | `:340` |
+| all | grouping round-trips through the same seam with a fenced, prose-prefixed reply | `:358` |
+
+There is **no proptest and no insta** in this crate; `wiremock` is the only
+dev-dependency. Unit tests live beside their code:
+`crates/ai/src/lib.rs:69` (every `PROVIDER_IDS` entry round-trips through
+`provider_for` with a non-empty default model, and `"gemini"` returns `None`),
+`crates/ai/src/lib.rs:82` (Ollama estimates 0.0, OpenAI more), the four in
+`crates/ai/src/client.rs:140-164` (debug redaction, echoed-key scrubbing,
+char-boundary-safe truncation at 513 chars, whitespace-only key ⇒ `MissingKey`),
+and the five in `crates/ai/src/cost.rs:150-176`.
+
+## Extension points
+
+- **A fourth provider** → [Add an AI provider](/guides/add-an-ai-provider). The
+  short version is seven edits: the new `crates/ai/src/<name>.rs`, the `pub mod` +
+  `pub use` at `crates/ai/src/lib.rs:25-42`, a `provider_for` arm at
+  `crates/ai/src/lib.rs:52-56`, widening `PROVIDER_IDS` at
+  `crates/ai/src/lib.rs:62` to `[&str; 4]`, a price table beside
+  `crates/ai/src/cost.rs:61-88` (or `Price::FREE`), a `default_model` arm at
+  `crates/ui/src/analyze.rs:332-338`, and wire tests mirroring
+  `crates/ai/tests/providers.rs`.
+- **Changing the batch size** → `crates/ai/src/analysis.rs:21`. `cost::tokens`
+  reads the same constant, so the estimate follows automatically.
+- **Changing what the model is asked for** → the two consts at
+  `crates/ai/src/prompt.rs:16` and `:32`. Both are counted by `cost::tokens`
+  through `.len()`, so a longer prompt re-prices itself without any other edit.
+- **The rationale for all of the above** → [ADR 9](/adr/byok-ai).

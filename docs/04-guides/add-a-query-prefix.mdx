@@ -1,0 +1,324 @@
+---
+title: Add a query prefix
+description: Add a new field:value token to the search box, from the Field enum in core through the parser, the proptests, the palette, and the syntax table.
+sidebar:
+  label: Add a query prefix
+  icon: filter
+---
+
+A query prefix is a `field:value` token the search box understands. The change
+is ten steps inside `starlet-core` — the enum, the parser, the evaluator, and
+three proptest lists — followed by two steps outside it: the command palette so
+the prefix is discoverable, and the syntax table so it is documented.
+
+The worked example is `topic:<name>`, matching `Repo::topics` **only**. It is
+deliberately narrower than the existing `tag:`, which matches tags *and* topics
+(`crates/core/src/query.rs:359-361`).
+
+Background: the seven parse stages are derived in
+[Query syntax](/reference/query-syntax); the crate contract is in
+[core](/crates/core).
+
+<Steps>
+
+<Step title="Add the Field variant — crates/core/src/query.rs:51-59">
+
+`Field` is the field *name* the user typed. It is `Copy` and has no payload.
+
+```rust crates/core/src/query.rs
+pub enum Field {
+    Language,
+    Tag,
+    Group,
+    Owner,
+    Stars,
+    Is,
+    Sort,
+    Topic,
+}
+```
+
+</Step>
+
+<Step title="Add the Field::parse arm — crates/core/src/query.rs:63-72">
+
+Match on lowercase only: `split_field` has already lowercased the left side
+(`crates/core/src/query.rs:207`). Aliases go here — this is where `lang` and
+`language` both resolve to `Field::Language`.
+
+```rust crates/core/src/query.rs
+fn parse(s: &str) -> Option<Self> {
+    match s {
+        "lang" | "language" => Some(Field::Language),
+        "tag" => Some(Field::Tag),
+        "topic" => Some(Field::Topic),
+        // …
+        _ => None,
+    }
+}
+```
+
+An unmatched name returns `None` and the whole token becomes free text.
+
+</Step>
+
+<Step title="Bump Field::ALL — crates/core/src/query.rs:76-78">
+
+`Field::ALL` is the prefix list the palette and the completion hints offer. Its
+length is hard-coded.
+
+```rust crates/core/src/query.rs
+pub const ALL: [&'static str; 8] = [
+    "lang:", "tag:", "group:", "owner:", "stars:", "is:", "sort:", "topic:",
+];
+```
+
+Forgetting the `7` → `8` bump is a compile error. That is the intended safety
+net, not an annoyance.
+
+</Step>
+
+<Step title="Add the Filter variant — crates/core/src/query.rs:37-47">
+
+`Filter` is the *evaluated* clause. Skip this step only if the prefix reuses an
+existing filter (as `language` reuses `Language`) or sets `Query::sort` instead
+of producing a clause.
+
+```rust crates/core/src/query.rs
+pub enum Filter {
+    Language(String),
+    Tag(String),
+    Topic(String),
+    // …
+}
+```
+
+Polarity never lives inside `Filter` — it lives on `Clause::negated`
+(`crates/core/src/query.rs:31-33`).
+
+</Step>
+
+<Step title="Add the apply arm — crates/core/src/query.rs:179-201">
+
+`apply` has already called `unquote` on the value
+(`crates/core/src/query.rs:178`), so `topic:"web assembly"` arrives without its
+quotes.
+
+```rust crates/core/src/query.rs
+Field::Topic => Applied::Clause(Filter::Topic(value)),
+```
+
+</Step>
+
+<Step title="Add a value parser if the value is not a bare string — crates/core/src/query.rs:259">
+
+`topic:` needs no parser. When a prefix does need one, model it on
+`parse_star_range` (`crates/core/src/query.rs:259`) — return `Option<T>`, never
+`Result` — and reach for `parse_count` (`crates/core/src/query.rs:309`) for
+numbers with `k`/`m` suffixes.
+
+```rust crates/core/src/query.rs
+/// GitHub topics are already kebab-case and single-token; anything else is
+/// almost certainly not a topic, so let it fall through to free text.
+fn parse_topic(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+```
+
+Then the `apply` arm takes the `Stars` shape at
+`crates/core/src/query.rs:184-187`:
+
+```rust crates/core/src/query.rs
+Field::Topic => match parse_topic(&value) {
+    Some(topic) => Applied::Clause(Filter::Topic(topic)),
+    None => Applied::NotAValue,
+},
+```
+
+`Applied::NotAValue` is what keeps the raw token alive as free text instead of
+throwing the user's input away (`crates/core/src/query.rs:161-162`).
+
+</Step>
+
+<Step title="Add the Filter::matches arm — crates/core/src/query.rs:352-369">
+
+Every existing arm compares with `eq_ignore_ascii_case`. Match that.
+
+```rust crates/core/src/query.rs
+Filter::Topic(topic) => repo.topics.iter().any(|t| t.eq_ignore_ascii_case(topic)),
+```
+
+`Filter::matches` is called from `Query::matches`, which ANDs every clause as
+`filter.matches(repo) != clause.negated` (`crates/core/src/query.rs:344-348`).
+Return the *unnegated* truth here and the outer negation composes correctly.
+
+</Step>
+
+<Step title="Add model support only if the data is not already on Repo — crates/core/src/model.rs:17-43">
+
+`topic:` needs nothing: `topics: Vec<String>` already exists at
+`crates/core/src/model.rs:36`. For genuinely new data, add the field to `Repo`
+(everything derives `Default`, so it needs a zero value, and everything derives
+`Eq`, so no bare `f32`), and add a lookup helper next to `has_tag`/`in_group`
+(`crates/core/src/model.rs:63-69`) if the match is non-trivial.
+
+A new field on `Repo` also means a store column and a sync mapping — that is
+[Add a synced field](/guides/add-a-synced-field).
+
+</Step>
+
+<Step title="Add a unit test and extend recognises_every_prefix — crates/core/src/query.rs:373">
+
+Add a focused case in the `tests` module at `crates/core/src/query.rs:373`, and
+extend `recognises_every_prefix` (`crates/core/src/query.rs:389-408`) so the
+"every prefix in one query" test stays honest.
+
+```rust crates/core/src/query.rs
+#[test]
+fn topic_matches_topics_but_not_tags() {
+    let q = parse("topic:WASM");
+    assert_eq!(filters(&q), vec![Filter::Topic("wasm".into())]);
+
+    let mut repo = Repo {
+        topics: vec!["wasm".into()],
+        ..Default::default()
+    };
+    assert!(q.matches(&repo));
+
+    repo.topics.clear();
+    repo.tags = vec![RepoTag {
+        name: "wasm".into(),
+        source: TagSource::User,
+        confidence: 1.0,
+    }];
+    assert!(!q.matches(&repo), "topic: must not read the tag list");
+}
+```
+
+</Step>
+
+<Step title="Add the prefix to all three proptest lists — crates/core/tests/query_proptest.rs">
+
+Three properties enumerate the prefixes by hand. All three must learn about the
+new one, or they keep passing while covering seven prefixes out of eight.
+
+| Property | Location | What it asserts |
+| --- | --- | --- |
+| `known_prefixes_never_leak_into_text` | `crates/core/tests/query_proptest.rs:51-64` | a recognised `field:value` never appears in `Query::terms` |
+| `negation_inverts_matching` | `crates/core/tests/query_proptest.rs:80` | `-p:v` and `p:v` always disagree about the same repo |
+| `incomplete_prefixes_are_inert` | `crates/core/tests/query_proptest.rs:114` | `topic:` with an empty value yields an empty `Query` |
+
+The third is an alternation regex over the field names — add `topic` to it.
+
+</Step>
+
+<Step title="Offer it in the command palette — crates/ui/src/palette.rs:96-100">
+
+Nothing above `core` is required for the prefix to *work*, but nothing
+discovers it either. `all_commands` builds the palette list; a filter shortcut
+is data, not code.
+
+```rust crates/ui/src/palette.rs
+Command::Filter {
+    label: "WebAssembly projects",
+    query: "topic:wasm",
+},
+```
+
+`Command::query_hint` (`crates/ui/src/palette.rs:65-69`) then shows the query
+string beside the row, so the palette teaches the language rather than hiding
+it.
+
+</Step>
+
+<Step title="Document it in the prefix table — /reference/query-syntax">
+
+Add a row to the prefix table in [Query syntax](/reference/query-syntax): the
+accepted names, the value grammar, what it matches, and what it does *not*
+match. For `topic:` the last column is the point of the feature — unlike
+`tag:`, it does not read the tag list.
+
+</Step>
+
+</Steps>
+
+## Verify
+
+```sh
+just test-crate core          # unit tests + all eight proptests
+just test-crate ui            # the palette's parse round-trip
+just test-one recognises_every_prefix
+```
+
+Tests that fail **by construction** if you skip a step — treat these as safety
+nets, not as chores:
+
+| Skipped step | What fails | Where |
+| --- | --- | --- |
+| bump `Field::ALL` | compile error: wrong array length | `crates/core/src/query.rs:76` |
+| `Filter::matches` arm | compile error: non-exhaustive match | `crates/core/src/query.rs:352-369` |
+| `apply` arm | compile error: non-exhaustive match | `crates/core/src/query.rs:179-201` |
+| a panicking value parser | `never_panics` | `crates/core/tests/query_proptest.rs:22` |
+| empty value becomes free text | `incomplete_prefixes_are_inert` | `crates/core/tests/query_proptest.rs:114` |
+| value leaks into `Query::terms` | `known_prefixes_never_leak_into_text` | `crates/core/tests/query_proptest.rs:51-64` |
+| a palette query that does not parse to a clause | `every_filter_shortcut_parses_into_a_clause` | `crates/ui/src/palette.rs:395` |
+
+`Field::parse`'s match is *not* a safety net — it has a `_ => None` arm, so a
+missing entry compiles fine and silently turns the prefix into free text. Only
+the unit test catches that.
+
+## Traps
+
+::::danger[The value parser must not panic]
+`query::parse` runs on every keystroke against half-typed text
+(`crates/core/src/query.rs:139`). It is total by contract and `never_panics`
+(`crates/core/tests/query_proptest.rs:22`) enforces it over arbitrary 0–200
+character strings. Your parser's failure mode is `None` → `Applied::NotAValue`
+→ free text. Never `unwrap`, never index a string by byte offset without
+checking the byte is ASCII — the trick `parse_count` uses at
+`crates/core/src/query.rs:315-319`.
+::::
+
+**An empty value must be skipped, not turned into free text.** Stage four of
+the parser drops a token whose value side is empty entirely
+(`crates/core/src/query.rs:151-154`), so `parse("topic:")` is
+`Query::is_empty()`. This is not a nicety: the moment the user types the colon,
+a prefix that became free text would search for the literal string `topic:` and
+blank the result list mid-word.
+
+**`Field::ALL`'s hard-coded `7` is deliberate.** It is the compile error that
+reminds you the palette and the completion hints read that array. Do not
+replace it with a slice or a `Vec` to make the error go away.
+
+**Use `eq_ignore_ascii_case`, not `to_lowercase()` comparison.** Every existing
+arm of `Filter::matches` does (`crates/core/src/query.rs:352-369`). The
+consequence — non-ASCII case is *not* folded, so `topic:CAFÉ` will not match
+`café` — is a known, uniform limitation. A single arm that behaves differently
+is worse than a limitation that is consistent.
+
+**A recognised field with an unparseable value keeps the RAW token.**
+`Applied::NotAValue` pushes `raw.clone()` (`crates/core/src/query.rs:161-162`) —
+the token *before* dash-stripping and *without* `unquote`. So `-topic:a b`
+becomes the literal free-text term `-topic:a`, dash and all. That is
+intentional (the user sees their own typing echoed back into the search), but
+it means the term you find in `Query::terms` is not the value your parser
+rejected.
+
+**Quoting is the escape hatch, and it works by accident of tokenization.** A
+quoted token like `"topic:wasm"` reaches `split_field` with its quote
+characters still attached (`crates/core/src/query.rs:223-227`), so the left
+side is `"topic` — `Field::parse` fails and the whole thing becomes a free-text
+search for `topic:wasm`. Do not "fix" that by unquoting earlier.
+
+**`sort:` prefixes are a different shape.** A sort key produces no clause: it
+assigns `Query::sort` (`crates/core/src/query.rs:158`) and last one wins. The
+extra steps are a `SortKey` variant, its private `parse` and `label` arms, a
+bump of `SortKey::ALL` from `5`, a `sort_by` arm in
+`crates/core/src/rank.rs:155-190` that **must** end in
+`.then_with(|| tie_break(...))` or the order stops being total and rows flicker
+between renders, and `sort_token` in `crates/ui/src/palette.rs:320-328` — whose
+match is exhaustive, so it will refuse to compile until you handle it.

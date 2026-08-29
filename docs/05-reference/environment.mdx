@@ -1,0 +1,166 @@
+---
+title: Environment
+description: Every environment variable Starlet reads, where its database lives on each platform, what goes into the OS keychain, and what is never persisted at all.
+sidebar:
+  label: Environment
+  icon: terminal
+---
+
+Starlet has no configuration file. What it reads from the outside world is four
+environment variables, one SQLite path, and two kinds of keychain entry — and
+that is the complete list.
+
+## Variables
+
+| Variable | Read at | Default | Effect |
+| --- | --- | --- | --- |
+| `STARLET_DB` | `crates/app/src/main.rs:45-48` | `default_database_path()` | Points the app at a different SQLite file |
+| `STARLET_GITHUB_CLIENT_ID` | `crates/sync/src/auth.rs:30-40` | the compile-time `option_env!` of the same name | The GitHub App client id used by the device flow |
+| `STARLET_LOG` | `crates/app/src/main.rs:24-30` | `"starlet=info,warn"` | `tracing_subscriber` env filter, written to stderr |
+| `BLUME_RUNTIME_DIR` | this documentation site only | the framework default | Relocates the generated Astro runtime |
+
+### `STARLET_DB`
+
+Read once, in the binary, as `std::env::var_os("STARLET_DB")`
+(`crates/app/src/main.rs:45-48`). If it is set the value is used verbatim as a
+path; otherwise the app falls back to `starlet_store::default_database_path()`.
+
+The **store crate never reads it**. `starlet-store` only offers
+`default_database_path()`; resolving the override is a decision the binary
+makes, which is why a test or an embedding can open any file it likes without
+an environment dance.
+
+`just demo` uses it to launch against a throwaway corpus —
+`STARLET_DB={{db}} cargo run -p starlet-app` (`Justfile:45`) — which is the
+supported way to run two builds side by side against different data.
+
+### `STARLET_GITHUB_CLIENT_ID`
+
+Resolved by `client_id()` (`crates/sync/src/auth.rs:30-40`), which checks two
+sources in this order:
+
+1. The **runtime** environment variable. It wins.
+2. The **compile-time** `option_env!("STARLET_GITHUB_CLIENT_ID")` baked in at
+   build time.
+
+In both cases the value is trimmed and an empty result is treated as absent
+(`crates/sync/src/auth.rs:32`, `:38`), so exporting the variable as an empty or
+whitespace-only string is the same as not exporting it. The runtime override
+exists so you can point a self-registered GitHub App at an existing build
+without recompiling (`crates/sync/src/auth.rs:26-29`).
+
+::::info[Absent is a normal state, not an error]
+`client_id()` returning `None` does not stop the app. Starlet opens the
+database and runs read-only against whatever is already mirrored; only
+sign-in is unavailable. Pressing sign-in with no client id pushes an
+error notification naming the variable and returns
+(`crates/ui/src/signin.rs:46-54`).
+::::
+
+See [Register a GitHub App](/getting-started/github-app).
+
+### `STARLET_LOG`
+
+A `tracing_subscriber::EnvFilter`, read via `try_from_env("STARLET_LOG")` with
+the fallback `"starlet=info,warn"` and stderr as the writer
+(`crates/app/src/main.rs:24-30`). Standard filter syntax, so
+`STARLET_LOG=starlet_sync=debug,warn` narrows the noise to the sync engine.
+
+### `BLUME_RUNTIME_DIR`
+
+Documentation-site only — it has nothing to do with the Rust binary. Blume
+generates an Astro project on disk to build the site; `BLUME_RUNTIME_DIR` moves
+that generated runtime somewhere else, so a build cannot corrupt the runtime a
+dev server is already using. The docs CI workflow sets it to `.blume-verify`
+for exactly that reason (`.github/workflows/docs.yml:41`).
+
+## Database paths
+
+With `STARLET_DB` unset, `default_database_path()`
+(`crates/store/src/lib.rs:130-134`) derives the location from
+`directories::ProjectDirs::from("dev", "starlet", "starlet")` and appends
+`starlet.db` to the resulting data directory:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `~/.local/share/starlet/starlet.db` |
+| macOS | `~/Library/Application Support/starlet/starlet.db` |
+| Windows | `%APPDATA%\starlet\data\starlet.db` |
+
+Documented in place at `crates/store/src/lib.rs:125-129`. If `ProjectDirs`
+cannot determine a data directory — a stripped container, a service account with
+no home — the call returns `StoreError::NoDataDir`
+(`crates/store/src/lib.rs:131-132`) and startup fails with a message naming the
+path resolution step. Set `STARLET_DB` in that situation.
+
+`Store::open` creates the parent directory if it is missing
+(`crates/store/src/lib.rs:62-65`), so the first launch needs nothing prepared.
+
+Because the database runs in WAL mode
+(`crates/store/src/lib.rs:69`), two sidecars live beside the file:
+`starlet.db-wal` and `starlet.db-shm`. Deleting the database means deleting all
+three — which is what `just demo-clean` does (`Justfile:49`).
+
+## Keychain entries
+
+Secrets live in the OS keychain and nowhere else. Everything Starlet stores
+uses one service name with a per-secret account:
+
+| Service | Account | Holds | Cite |
+| --- | --- | --- | --- |
+| `dev.starlet.starlet` | `github-token` | the GitHub App device-flow token | `crates/sync/src/auth.rs:19-20`, `:199-201` |
+| `dev.starlet.starlet` | `ai:{provider}` | one BYOK API key per provider | `crates/sync/src/auth.rs:242-245` |
+
+The backing store depends on the platform, chosen by the `keyring` crate's
+feature set in the workspace manifest (`Cargo.toml:34`):
+
+| Platform | Feature | Backend |
+| --- | --- | --- |
+| macOS | `apple-native` | the system Keychain |
+| Windows | `windows-native` | Windows Credential Manager |
+| Linux | `sync-secret-service` | the freedesktop Secret Service over D-Bus (GNOME Keyring, KWallet) |
+
+**Reads are fail-soft; writes are fail-loud.** `TokenStore::load` maps every
+error — and an empty string — to `None`, logging at debug
+(`crates/sync/src/auth.rs:209-221`), so a locked or unavailable keychain reads
+as "signed out", which is the only useful response: the app opens, the mirror is
+searchable, and sign-in is offered again. `save` and `clear` instead return
+`SyncError::Keychain` (`:223-227`, `:230-235`), with `keyring::Error::NoEntry`
+treated as success on `clear` so signing out twice is not an error.
+`ProviderKeyStore` follows the same shape (`:247-266`).
+
+Every one of these calls is **blocking**, because the platform APIs behind
+`keyring` are synchronous (`crates/sync/src/auth.rs:194-195`). The UI runs them
+off the main thread through `Backend::spawn_blocking`
+(`crates/ui/src/services.rs:62`). The one exception is `Session::restore`
+(`crates/ui/src/services.rs:113`), which reads the keychain synchronously at
+startup — one local-daemon round trip, before any window exists, because it
+decides the first painted frame.
+
+## What is never persisted
+
+- **The GitHub token never reaches SQLite, a configuration file, or a log
+  line.** It lives in the keychain and in one `String` in memory
+  (`crates/sync/src/auth.rs:8-9`), and is never held in view state
+  (`crates/ui/src/signin.rs:4-6`).
+- **AI provider keys never reach SQLite either.** The settings dialog writes
+  them to the keychain on **blur**, not per keystroke
+  (`crates/ui/src/settings.rs:269-293`). What `sync_state` stores about AI is
+  only the provider name, model and endpoint —
+  `ui.ai_provider`, `ui.ai_model`, `ui.ai_endpoint`
+  (`crates/store/src/state.rs:20-24`).
+- **Three `Debug` impls elide their secret.** `DeviceFlow` prints only its
+  `client_id` and `finish_non_exhaustive()`
+  (`crates/sync/src/auth.rs:93-99`); `GitHub` never renders the token
+  (`crates/sync/src/client.rs:102-105`); `ApiKey` prints `ApiKey(redacted)`, or
+  `ApiKey(unset)` when empty (`crates/ai/src/client.rs:39-47`), with
+  `debug_never_prints_the_key` (`crates/ai/src/client.rs:141`) asserting it.
+  A provider error body is scrubbed of the key before it becomes an
+  `AiError::Status` (`crates/ai/src/client.rs:69`).
+
+## See also
+
+- [Getting started](/getting-started) — first launch and the demo database.
+- [Register a GitHub App](/getting-started/github-app) — where
+  `STARLET_GITHUB_CLIENT_ID` comes from.
+- [`store`](/crates/store) — the crate that owns the database file.

@@ -1,0 +1,455 @@
+---
+title: sync
+description: The only crate that speaks HTTP — the GitHub App device flow, the keychain, the REST and GraphQL client, and the two-mode sync engine.
+sidebar:
+  label: sync
+  icon: refresh-cw
+---
+
+`starlet-sync` owns every byte that travels to and from github.com: the GitHub
+App device flow, OS-keychain token storage, the REST + GraphQL client, the
+network wire structs, and the engine that reconciles the remote star list into
+the local SQLite mirror. "Everything that talks to github.com lives here. The
+layers above see only `starlet_core` types and a stream of `SyncEvent`"
+(`crates/sync/src/lib.rs:3-4`).
+
+Three things it must never do:
+
+- **Know a window exists.** No GPUI types, no rendering, no blocking on a
+  renderer. Progress leaves through an `UnboundedSender<SyncEvent>` so the UI
+  owns its own back-pressure (`crates/sync/src/engine.rs:11-13`).
+- **Leak the token.** It never touches SQLite, the config file, or a log line —
+  it lives in the OS keychain and in one `String` in memory
+  (`crates/sync/src/auth.rs:8-9`). Both `GitHub` and `DeviceFlow` have
+  hand-written `Debug` impls that elide it
+  (`crates/sync/src/client.rs:102-109`, `crates/sync/src/auth.rs:93-99`).
+- **Let a wire type escape upward.** "Nothing above `sync` should see a
+  `stargazers_count` or a `pushed_at`" (`crates/sync/src/wire.rs:3-4`).
+
+::::info[`wire.rs` is the single conversion boundary]
+`RepoPayload::into_repo` (`crates/sync/src/wire.rs:77`) is the only place in the
+workspace where GitHub JSON becomes a domain `Repo`. Every path — the star
+listing, the conditional metadata refresh — funnels through it. If a field needs
+renaming, reshaping, or defaulting on the way in, it happens there and nowhere
+else.
+::::
+
+## Modules
+
+| Module | Contents |
+| --- | --- |
+| `lib.rs` | `SyncError`, `Result`, the flat re-export surface (`crates/sync/src/lib.rs:6-14`) |
+| `auth.rs` | Device flow against github.com, `TokenStore`, `ProviderKeyStore`, `client_id` |
+| `client.rs` | One `reqwest::Client`, the `request`/`send`/`check` funnel, rate-limit accounting, five REST paths and two GraphQL documents |
+| `engine.rs` | `SyncEngine` and the full/incremental algorithms, cancellation, the event stream |
+| `wire.rs` | The serde structs mirroring GitHub's JSON, and `into_repo` |
+
+All four are `pub mod` and also re-exported flat (`crates/sync/src/lib.rs:11-14`),
+so `starlet_sync::GitHub` and `starlet_sync::client::GitHub` both work.
+
+## Errors
+
+`SyncError` (`crates/sync/src/lib.rs:18-39`) has eight variants:
+
+| Variant | Produced by |
+| --- | --- |
+| `Http(reqwest::Error)` | Transport failure or the client's 30 s timeout; `#[from]` (`:21`) |
+| `Auth(String)` | A `401` from the API (`crates/sync/src/client.rs:190`), and **every** device-flow failure (`crates/sync/src/auth.rs:132-142`, `:172-183`) |
+| `Keychain(String)` | A failed keychain **write** or entry construction (`crates/sync/src/auth.rs:199-201`, `:226`) |
+| `RateLimited { retry_after_secs, reset_at }` | A `403` or `429`; `retry_after_secs` from the `retry-after` header, `reset_at` from the last observed budget (`crates/sync/src/client.rs:191-194`) |
+| `NotFound` | A `404` (`crates/sync/src/client.rs:195`). Often caught and turned into an empty value rather than surfaced |
+| `Api { status, message }` | Any other non-success status, with the body's first 300 chars (`crates/sync/src/client.rs:196-199`), **and** a GraphQL error envelope at `status: 200` (`:399-406`) |
+| `Store(starlet_store::StoreError)` | Any DAO call the engine makes; `#[from]` (`:36`) |
+| `Cancelled` | The cancel flag was set at a star-page boundary (`crates/sync/src/engine.rs:163-165`, `:223-225`) |
+
+```rust crates/sync/src/lib.rs
+pub fn SyncError::needs_reauth(&self) -> bool {
+    matches!(self, SyncError::Auth(_))     // :46-48
+}
+```
+
+True **only** for `Auth(_)`. The UI uses it to choose between offering "sign in"
+and offering "retry" (`crates/sync/src/lib.rs:44-45`). Note the consequence:
+because every device-flow rejection is an `Auth`, a declined or expired grant
+also reports `needs_reauth() == true`.
+
+## The HTTP client
+
+Constants (`crates/sync/src/client.rs:19-34`):
+
+| Constant | Value |
+| --- | --- |
+| `DEFAULT_BASE` | `https://api.github.com` (`:19`) |
+| `STAR_MEDIA_TYPE` | `application/vnd.github.star+json` (`:20`) |
+| `JSON_MEDIA_TYPE` | `application/vnd.github+json` (`:21`) |
+| `RAW_MEDIA_TYPE` | `application/vnd.github.raw` (`:22`) |
+| `API_VERSION` | `2022-11-28`, sent as `X-GitHub-Api-Version` (`:23`) |
+| `AGENT` | `concat!("starlet/", CARGO_PKG_VERSION)` (`:24`) |
+| `RESERVE` | `50` — private (`:28`) |
+| `GRAPHQL_BATCH` | `25` — public (`:34`) |
+
+`user_agent_client()` (`crates/sync/src/client.rs:85-91`) builds the shared
+`reqwest::Client`: that user agent and a 30 s timeout. Both `GitHub` and
+`DeviceFlow` use it "so they agree on timeouts and the user agent" (`:83-84`).
+
+### The funnel
+
+Every request goes through the same three steps:
+
+```rust crates/sync/src/client.rs
+fn       request(&self, method, url, accept: &'static str) -> RequestBuilder  // :150
+async fn send(&self, builder: RequestBuilder) -> Result<Response>             // :164
+async fn check(&self, response: Response) -> Result<Response>                 // :176
+```
+
+`request` sets `Authorization: Bearer …`, `Accept`, `X-GitHub-Api-Version` and
+`User-Agent` (`:156-161`). `send` awaits `respect_budget()` first, then absorbs
+the response headers into the shared rate limit (`:164-172`). `check` maps the
+status:
+
+| Status | Result |
+| --- | --- |
+| Any 2xx, or `304` | Passes through untouched (`crates/sync/src/client.rs:178-180`) |
+| `401` | `SyncError::Auth("the GitHub token was rejected")` (`:190`) |
+| `403` or `429` | `SyncError::RateLimited` (`:191-194`) |
+| `404` | `SyncError::NotFound` (`:195`) |
+| anything else | `SyncError::Api` with the body's first 300 chars (`:196-199`) |
+
+`304` passing `check` is deliberate — but `repo_if_modified` short-circuits on
+it *before* calling `check` anyway (`:248-250`), so a not-modified response can
+never become an error.
+
+::::danger[`Accept` is a required parameter, never a default]
+`request` takes `accept: &'static str` rather than defaulting it, because
+"reqwest's `header` *appends*, so setting it twice sends two media types and
+GitHub silently answers with the first one it recognises — which for the star
+listing means losing `starred_at`"
+(`crates/sync/src/client.rs:144-149`). `starred_at` is the single field the
+`vnd.github.star+json` listing exists to obtain and the default browse ordering
+depends on it, so the failure is both silent and total. Never add a default
+`Accept` to `user_agent_client`, and never call `.header(ACCEPT, ..)` on a
+builder that already came out of `request`.
+::::
+
+### Rate limiting
+
+```rust crates/sync/src/client.rs
+pub struct RateLimit { pub limit: u32, pub remaining: u32, pub reset_at: Option<DateTime<Utc>> }
+                                            // :38-42, Copy + Default
+fn absorb(&mut self, headers: &HeaderMap)   // :45
+fn cooldown(&self, now) -> Option<Duration> // :59
+```
+
+`absorb` reads `x-ratelimit-limit`, `x-ratelimit-remaining` and
+`x-ratelimit-reset` (unix seconds) off every response
+(`crates/sync/src/client.rs:45-56`). `cooldown` returns `None` when `limit == 0`
+— the never-observed default — or when `remaining > RESERVE`, and otherwise the
+gap to `reset_at`, still `None` if the reset is already in the past (`:59-65`).
+
+`respect_budget` (`crates/sync/src/client.rs:136-142`) is awaited before every
+single request and **sleeps** rather than erroring: "sleeping here rather than
+failing keeps a long first sync correct at the cost of being slow, which is the
+right trade for a background job" (`:133-135`). The 50-request reserve exists so
+"an interactive action (opening a detail sheet) still has room after a sync"
+(`:26-27`).
+
+`with_base_url` (`crates/sync/src/client.rs:122-125`) trims a trailing slash and
+repoints the client. It is the seam the whole `wiremock` suite hangs off, and it
+is the reason no test needs a network stub at the `reqwest` level.
+
+`GitHub` is `Clone` (`:94`), but the clones **share one
+`Arc<Mutex<RateLimit>>`** (`:99`), so every clone cooperates on the same hourly
+budget. The mutex is a `std::sync::Mutex` held only across `absorb` or a copy
+(`:127-129`, `:167-170`) — never across an `.await`.
+
+## Endpoints
+
+Against `api.github.com` (or whatever `with_base_url` set):
+
+| Path | Method | `Accept` | Response | Cite |
+| --- | --- | --- | --- | --- |
+| `/user` | GET | `vnd.github+json` | `wire::Viewer` | `crates/sync/src/client.rs:204` |
+| `/user/starred?per_page&page&sort=created&direction=desc` | GET | `vnd.github.star+json` | `Vec<StarredItem>` plus `Link` | `:216` |
+| `/repos/{full_name}` | GET, optional `If-None-Match` | `vnd.github+json` | `Conditional<RepoPayload>` | `:234` |
+| `/repos/{full_name}/contributors?per_page` | GET | `vnd.github+json` | `Vec<ContributorPayload>`; `NotFound` becomes an empty vec | `:267` |
+| `/repos/{full_name}/readme` | GET | `vnd.github.raw` | Body as text; `NotFound` becomes `Ok(None)` | `:287` |
+| `/graphql` — `viewer { starredRepositories { totalCount } }` | POST | `vnd.github+json` | Local typed `Data` / `ViewerNode` / `TotalCount` | `:303` |
+| `/graphql` — aliased `repository { databaseId languages }` | POST | `vnd.github+json` | `serde_json::Value`, walked dynamically | `:329` |
+
+And, entirely separately, on **github.com** — not the API host — the two
+device-flow endpoints in `auth.rs`:
+
+| Path | Method | `Accept` | Response | Cite |
+| --- | --- | --- | --- | --- |
+| `/login/device/code` | POST | `application/json` | `DeviceGrant` | `crates/sync/src/auth.rs:120` |
+| `/login/oauth/access_token` | POST | `application/json` | private `TokenResponse` → `PollOutcome` | `crates/sync/src/auth.rs:146` |
+
+Two things about the GraphQL half:
+
+- **GraphQL errors arrive as HTTP 200.** The private `graphql<T>` helper
+  inspects the `{ data, errors }` envelope, not the status, and joins
+  `errors[].message` into `SyncError::Api { status: 200, .. }`
+  (`crates/sync/src/client.rs:368-407`). An empty error list becomes
+  `"empty GraphQL response"` (`:401-403`).
+- **`build_languages_query` skips names without a `/`**
+  (`crates/sync/src/client.rs:414-416`), so the `r{ix}` aliases are sparse —
+  `r0` may not exist. That is precisely why `languages_batch` matches results by
+  `databaseId` (`:344-346`) rather than by alias position. It also strips `"`
+  and `\` from owner and name before interpolating (`:421-422`).
+  `contributors` is REST-only because "the GraphQL schema has no contributors
+  connection, so this cannot join the batched language query" (`:265-266`).
+
+## Wire structs
+
+| Struct | Shape | Cite |
+| --- | --- | --- |
+| `StarredItem` | `starred_at: Option<String>`, `repo: RepoPayload` — the `star+json` wrapper that lets the star timestamp travel with the repository (`:10-12`) | `crates/sync/src/wire.rs:14-17` |
+| `RepoPayload` | `id`, `node_id`, `full_name`, `name`, `owner: OwnerPayload`, `html_url`, `description`, `stargazers_count`, `pushed_at`, `language`, `archived`, `fork`, `topics`, `updated_at` | `:20-40` |
+| `OwnerPayload` | `login` only | `:43-45` |
+| `ContributorPayload` | `login`, `avatar_url`, `contributions` | `:48-54` |
+| `Viewer` | `login`, `avatar_url`, `name` — for the signed-in avatar | `:58-63` |
+
+`stargazers_count`, `archived`, `fork`, `topics`, `avatar_url` and
+`contributions` all carry `#[serde(default)]`; everything genuinely optional is
+an `Option`. A sparse payload must never fail a row.
+
+`RepoPayload::into_repo(starred_at, synced_at)`
+(`crates/sync/src/wire.rs:77-100`) performs three renames:
+
+| Wire | Domain |
+| --- | --- |
+| `stargazers_count` | `stargazers` (`:86`) |
+| `pushed_at` | `last_commit_at`, through `parse_ts` (`:87`) |
+| `language` | `primary_language` (`:88`) |
+
+It leaves `languages`, `contributors`, `tags` and `groups` empty **on purpose**:
+"the star listing does not carry them, and the store's upsert preserves whatever
+it already has rather than letting this emptiness overwrite a previous fetch"
+(`:74-76`). The matching preservation rules live in
+[`store`](/crates/store#the-preserving-upsert). The private `parse_ts` (`:65-69`)
+accepts RFC 3339 only and silently yields `None` on anything else.
+
+## The engine
+
+```rust crates/sync/src/engine.rs
+pub enum SyncMode  { Full, Incremental }                     // :40-43
+pub enum SyncPhase { Stars, Languages, Metadata }            // :46-50
+pub fn SyncPhase::label(self) -> &'static str                // :53
+pub enum SyncEvent { Started, Progress, Upserted, Removed, Finished, Failed }  // :64-79
+pub struct SyncSummary { seen, written, removed, languages_filled, metadata_refreshed }  // :82-88
+pub struct SyncEngine { github: GitHub, store: Store, cancel: Arc<AtomicBool> } // :91-95
+```
+
+`label()` returns `"Fetching stars"`, `"Fetching languages"`,
+`"Refreshing metadata"` (`crates/sync/src/engine.rs:55-57`) — the strings the
+status line renders. `SyncEvent::Upserted(Vec<Repo>)` carries "rows that
+changed. The search index reindexes exactly these" (`:73`), and
+`Progress.total` is `Option` because "the star count arrives with the first
+page, not before it" (`:69-70`).
+
+Private budget constants (`crates/sync/src/engine.rs:29-37`):
+
+| Constant | Value | Rationale |
+| --- | --- | --- |
+| `PER_PAGE` | `100` | GitHub's maximum (`:29`) |
+| `REFRESH_BUDGET` | `250` | "Bounds the worst case at roughly a quarter of the hourly REST budget" (`:31-32`) |
+| `LANGUAGE_BUDGET` | `500` | Repositories per run (`:34`) |
+| `STALE_AFTER_HOURS` | `24` | Metadata older than this is refreshed (`:36`) |
+
+Public surface:
+
+| Method | Semantics | Cite |
+| --- | --- | --- |
+| `new(github, store)` | Owns one client and one store for the run | `:98` |
+| `cancel_flag() -> Arc<AtomicBool>` | The caller flips it; the engine reads it with `Ordering::Relaxed` at each checkpoint | `:107`, `:111-113` |
+| `needs_full_sync(store) -> bool` | **Associated function, not a method.** `KEY_INITIAL_SYNC_DONE != "1"` | `:116-124` |
+| `run(mode, events) -> Result<SyncSummary>` | Emits `Started`, dispatches, then writes `KEY_LAST_SYNC` and emits `Finished`, or emits `Failed(err.to_string())` | `:127-151` |
+| `fetch_contributors(id, full_name)` | Top 10 over REST, cached via `set_contributors` | `:422-430` |
+| `fetch_readme(id, full_name)` | 7-day cache via `store.readme(id, cutoff)`; on a miss, fetch and `set_readme` | `:433-443` |
+
+**Every `events.send` result is discarded** (`crates/sync/src/engine.rs:132`,
+`:144`, `:147`, and throughout). A dropped receiver never blocks and never fails
+a sync.
+
+`fetch_contributors` and `fetch_readme` are the two lazily-fetched paths. They
+are "called when a detail sheet opens, never during a sync: contributors are
+REST-only and would cost one request per repository" (`:419-421`).
+
+The two algorithms in four sentences: **`run_full`** pages the whole
+newest-first star list, upserting each page and recording every id it sees, then
+deletes the local ids it never saw, writes the watermark and
+`KEY_INITIAL_SYNC_DONE`, and backfills languages. **`run_incremental`** reads
+only the prefix of stars newer than the stored watermark, then refreshes
+metadata older than 24 h and backfills languages. Because unstars leave no trace
+in a newest-first listing, it finishes by comparing one GraphQL `totalCount`
+against `repo_count()` and escalates to a full pass only when they disagree
+(`crates/sync/src/engine.rs:270-282`). The full derivation — page loop,
+`take_while`, watermark advance, conditional refresh, cancellation checkpoints —
+is in [Sync pipeline](/architecture/sync-pipeline).
+
+## Authentication
+
+`client_id()` (`crates/sync/src/auth.rs:30-40`) resolves in two steps: the
+runtime `STARLET_GITHUB_CLIENT_ID` env var wins if it is set and not blank
+(`:31-35`), otherwise the compile-time `option_env!` of the same name, trimmed
+and rejected if empty (`:36-39`). The env override exists "so a user can point a
+self-registered App at their own build without recompiling" (`:27-29`).
+`None` is a normal state, not an error: the app runs read-only against the
+existing database. See [Environment](/reference/environment) and
+[ADR 7](/adr/github-app-device-flow).
+
+| Item | Notes | Cite |
+| --- | --- | --- |
+| `DeviceFlow` | `Clone`; holds the shared client, the client id, and both endpoint URLs | `crates/sync/src/auth.rs:86-91` |
+| `DeviceFlow::new` | Reuses `client::user_agent_client()` | `:102-109` |
+| `DeviceFlow::with_base_url` | Rewrites **both** endpoints to `{base}/login/device/code` and `{base}/login/oauth/access_token` | `:112-117` |
+| `request_code() -> DeviceGrant` | `POST` the device-code endpoint | `:120-143` |
+| `poll_once(device_code) -> PollOutcome` | One poll. **Never sleeps** — "the caller owns the sleep so it can also honour cancellation" (`:145`) | `:146-185` |
+| `DeviceGrant` | `device_code`, `user_code`, `verification_uri`, `expires_in`, `interval` | `:44-54` |
+| `DeviceGrant::poll_interval` | `interval.max(1)` seconds, so never zero | `:57-59` |
+| `DeviceGrant::expires_in` | The grant's lifetime as a `Duration` | `:61-63` |
+| `PollOutcome` | `Pending`, `SlowDown(Duration)`, `Authorized(String)`; `PartialEq + Eq` so fixtures compare it directly | `:76-82` |
+
+`access_token` is checked **before** `error` (`crates/sync/src/auth.rs:164-166`),
+and a `slow_down` without an `interval` defaults to 10 s, clamped to at least 1
+(`:169-171`). The full state machine — every error code, who owns the interval
+and the deadline, and what the dialog does with each outcome — is in
+[GitHub App and sign-in](/getting-started/github-app).
+
+### Keychain
+
+| Item | Service | Account | Cite |
+| --- | --- | --- | --- |
+| `TokenStore` | `dev.starlet.starlet` | `github-token` | `crates/sync/src/auth.rs:19-20`, `:196` |
+| `ProviderKeyStore` | `dev.starlet.starlet` | `ai:{provider}` | `:239`, `:243` |
+
+`TokenStore` exposes `load() -> Option<String>` (`:209-221`),
+`save(token) -> Result<()>` (`:223-227`) and `clear() -> Result<()>`
+(`:230-235`), where `keyring::Error::NoEntry` counts as success (`:232`).
+`ProviderKeyStore` mirrors that shape per provider (`:247-266`).
+
+::::warning[Blocking, and asymmetric about failure]
+Every keychain method is **blocking** — "the platform APIs behind `keyring` are
+synchronous, and callers run them off the UI thread"
+(`crates/sync/src/auth.rs:194-195`). Calling one directly on an async executor
+thread stalls that thread.
+
+They are also **fail-soft on read, fail-loud on write**. `TokenStore::load`
+swallows every error into `None` plus a `tracing::debug`, because "a keychain
+that is locked or unavailable also reads as `None`: the app then behaves exactly
+as it does when signed out, which is the only useful response" (`:206-208`,
+`:216-219`). `ProviderKeyStore::load` does the same with `.ok()` (`:247-253`).
+`save` and `clear` return `SyncError::Keychain`.
+::::
+
+## Key invariants
+
+1. **A full listing is the only trustworthy unstar diff.** `run_full` diffs
+   `known_ids()` against the ids it actually saw
+   (`crates/sync/src/engine.rs:188-189`). An incremental run cannot detect an
+   unstar at all — hence the count check.
+2. **`Link: rel="next"` is the only end-of-list signal.** "A full page does not
+   mean another page exists" (`crates/sync/src/client.rs:429-430`,
+   `:431-437`).
+3. **A `304` is not a refresh.** It only calls `touch_synced_at`
+   (`crates/sync/src/engine.rs:335-337`); `metadata_refreshed` stays 0 and no
+   `Upserted` is emitted.
+4. **A `404` during refresh does not delete.** It touches `synced_at` and leaves
+   the row: "the next full sync removes it if it is really gone, and guessing
+   would delete data on a transient error"
+   (`crates/sync/src/engine.rs:347-352`).
+5. **A metadata refresh must re-attach `starred_at`.**
+   `GET /repos/{full_name}` does not return it, so `refresh_stale` reloads the
+   existing row, converts with `into_repo(None, now)`, and copies `starred_at`
+   back before upserting (`crates/sync/src/engine.rs:339-341`). Losing it
+   destroys the default browse ordering. Any *other* field the repo endpoint
+   omits needs exactly the same treatment.
+6. **`RateLimited` aborts a phase; every other per-item error is logged and
+   skipped.** Both `refresh_stale` (`crates/sync/src/engine.rs:353-354`) and
+   `backfill_languages` (`:406-407`) `return Err` on `RateLimited` and
+   `tracing::warn!` on anything else.
+7. **Rate limiting sleeps rather than fails.** `respect_budget` blocks the task
+   once `remaining <= 50` (`crates/sync/src/client.rs:136-142`,
+   `:59-65`). A default `RateLimit` — nothing observed yet — never blocks.
+   There is no request-level retry anywhere in the crate.
+8. **`Incremental` with no watermark silently becomes a full sync**, and returns
+   the full run's summary (`crates/sync/src/engine.rs:211-215`). Reading a
+   summary without knowing which branch ran tells you less than it appears to.
+9. **An empty language result is skipped, not written**
+   (`crates/sync/src/engine.rs:392-395`). Since `ids_without_languages` matches
+   the literal `languages_json = '{}'`, a genuinely language-less repository is
+   re-queried on every single run, forever.
+
+## Tests
+
+`crates/sync/tests/sync.rs` drives the **real** `SyncEngine` and `DeviceFlow`
+against `wiremock`, so media types, `Link` pagination, `If-None-Match` and the
+GraphQL documents are all exercised as in production. Helpers: `starred()`
+builds a `star+json` entry (`:15`), `headers()` attaches rate-limit headers
+(`:38`), `mount_graphql()` mounts both documents discriminated by
+`body_string_contains` (`:45`), `drain` / `removed_ids` / `upserted_count`
+inspect the event stream (`:73`, `:81`, `:92`), and `engine()` wires an
+in-memory `Store` to a `GitHub` pointed at the mock server (`:102`).
+
+| Fixture | Line | Proves |
+| --- | --- | --- |
+| `full_sync_pages_through_the_star_list` | `:111` | `Link: rel="next"` drives page 2, `Started`/`Finished` bracket the stream, and the watermark is the **newest** star seen rather than the last processed |
+| `full_sync_backfills_languages_over_graphql` | `:172` | The GraphQL batch lands in `repo.languages` and orders correctly through `languages_by_size()` |
+| `full_sync_detects_unstars` | `:195` | A locally known repo absent from a complete listing is deleted and reported as `Removed` |
+| `incremental_sync_stops_at_the_watermark` | `:229` | The `take_while` prefix stops at the first known star. Page 2 is deliberately left unmounted, so requesting it would fail the test |
+| `incremental_sync_without_a_watermark_falls_back_to_full` | `:278` | The fallback is a *real* full sync — it sets `KEY_INITIAL_SYNC_DONE` |
+| `a_count_mismatch_triggers_reconciliation` | `:312` | A `totalCount` vs `repo_count` disagreement escalates to a full pass that removes the stale row |
+| `a_not_modified_refresh_costs_nothing_but_a_touch` | `:359` | `If-None-Match` is sent (matched exactly, `.expect(1)`), a 304 leaves `metadata_refreshed == 0`, and `synced_at` still moves forward so the repo is not retried |
+| `a_modified_refresh_updates_metadata_and_keeps_the_star_date` | `:406` | A 200 updates `stargazers` while preserving `starred_at`, which the repo endpoint does not return |
+| `rate_limiting_surfaces_as_a_typed_error` | `:464` | A 403 with `retry-after: 60` becomes `RateLimited { retry_after_secs: Some(60) }` and emits `SyncEvent::Failed` |
+| `an_expired_token_asks_for_reauthentication` | `:500` | A 401 yields an error whose `needs_reauth()` is true |
+| `contributors_and_readme_are_fetched_and_cached` | `:517` | Contributors are ordered and cached into the row, the README uses `Accept: vnd.github.raw`, and the second README call is served from cache — enforced by `.expect(1)` |
+| `a_repository_without_a_readme_is_not_an_error` | `:575` | A 404 README maps to `Ok(None)` |
+| `device_flow::a_device_grant_carries_the_user_code_and_interval` | `:607` | The device-code response deserialises into `user_code`, `poll_interval()`, `expires_in()` |
+| `device_flow::polling_reports_pending_slow_down_and_success` | `:631` | Table-driven: `authorization_pending` → `Pending`, `slow_down` + `interval` → `SlowDown(10s)`, `access_token` → `Authorized` |
+| `device_flow::a_declined_or_expired_grant_is_an_error` | `:661` | Both `access_denied` and `expired_token` produce an error with `needs_reauth() == true` |
+
+Six unit tests cover the pure functions. In `client.rs`:
+`language_query_aliases_every_repo` (`:444`),
+`language_query_skips_malformed_names` (`:452`),
+`cooldown_only_applies_once_the_reserve_is_reached` (`:459`, including "a past
+reset is not a reason to sleep" at `:476-482`), and
+`an_unseen_rate_limit_never_blocks` (`:486`). In `wire.rs`:
+`star_json_maps_onto_the_domain_model` (`:140`) against a trimmed but verbatim
+`star+json` payload, and `absent_optional_fields_do_not_fail_the_row` (`:169`)
+for the serde defaults. There is no `proptest`, no `insta` and no `gpui::test`
+in this crate. See [Testing](/development/testing).
+
+## Extension points
+
+- **A new field carried from GitHub to disk** →
+  [Add a synced field](/guides/add-a-synced-field), which walks `RepoPayload`,
+  the domain model, `into_repo`, the migration, and the store's positional
+  column list in one pass.
+- **A new REST endpoint** → a method on `GitHub`
+  (`crates/sync/src/client.rs:111`) built as
+  `self.check(self.send(self.request(method, url, ACCEPT_CONST)).await?).await`.
+  Never set `Accept` twice. A new media type gets a `const` beside the others at
+  `crates/sync/src/client.rs:19-24`. Then mount a `Mock` for it in
+  `crates/sync/tests/sync.rs`; `with_base_url` (`:122`) makes it testable with
+  no other change.
+- **A new GraphQL query** → write the document and call the private
+  `graphql::<T>()` (`crates/sync/src/client.rs:368`) with a local `Deserialize`
+  struct. `starred_total` (`:303`) is the typed shape; `languages_batch`
+  (`:329`) is the dynamic `Value` shape to copy when aliases are sparse. Batch
+  size is `GRAPHQL_BATCH` (`:34`).
+- **A new sync phase** → add a `SyncPhase` variant
+  (`crates/sync/src/engine.rs:46-50`) and its `label()` arm (`:53-59`), write a
+  private `async fn` modelled on `backfill_languages` (`:374`) — cancel check
+  per chunk, `RateLimited` propagates, other errors warn — add a field to
+  `SyncSummary` (`:82-88`), and call it from `run_full` and/or
+  `run_incremental`.
+- **A new keychain secret** → follow `ProviderKeyStore`
+  (`crates/sync/src/auth.rs:241-266`): reuse `KEYCHAIN_SERVICE` (`:19`) and pick
+  a distinct namespaced account string. All three methods will be blocking.
+
+The **schedule is not in this crate**. `SYNC_INTERVAL = 15 min` lives at
+`crates/ui/src/search.rs:60`, and `schedule_background_sync` — one run at launch
+if signed in, then a background timer that skips a tick while a sync is already
+running — at `crates/ui/src/search.rs:462`, with mode selection at `:509-513`.
+Nothing in `starlet-sync` knows when it will be called.

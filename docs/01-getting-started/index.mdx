@@ -1,0 +1,158 @@
+---
+title: Build and run
+description: Toolchain, platform packages, and the first cargo run — everything needed to get a debug build of Starlet on screen.
+sidebar:
+  label: Build and run
+  icon: rocket
+---
+
+Starlet is a plain Cargo workspace. There is no code generation step, no
+`build.rs` that downloads anything, and no non-Rust build system. Clone it and
+build it.
+
+## Toolchain
+
+The toolchain is **pinned**, in `rust-toolchain.toml`:
+
+```toml rust-toolchain.toml
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+```
+
+Nothing names a version anywhere else — not the `Justfile`, not the CI workflow.
+`rustup` applies the override automatically for any `cargo` or `rustc` call
+inside the checkout, so you never pass `+1.98.0`.
+
+::::warning[Do not install a second toolchain]
+Naming a toolchain in a CI setup action (`dtolnay/rust-toolchain@stable`, say)
+installs a toolchain the override then ignores — or worse, shadows the pin. The
+CI workflow deliberately does `rustup show active-toolchain || rustup toolchain
+install` instead, which reads `rust-toolchain.toml`.
+::::
+
+## Platform prerequisites
+
+GPUI renders through Vulkan on Linux, so Linux needs development packages for
+Vulkan, Wayland/X11, xkbcommon, fontconfig, D-Bus, and a C toolchain:
+
+<Tabs>
+  <Tab title="Debian / Ubuntu">
+
+```sh
+sudo apt-get install build-essential cmake pkg-config clang libclang-dev \
+  libvulkan-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+  libx11-dev libxcb1-dev libfontconfig1-dev libdbus-1-dev
+```
+
+  </Tab>
+  <Tab title="Arch">
+
+```sh
+sudo pacman -S base-devel cmake clang vulkan-icd-loader vulkan-headers \
+  libxkbcommon libxkbcommon-x11 wayland libx11 libxcb fontconfig dbus
+```
+
+  </Tab>
+  <Tab title="macOS / Windows">
+
+Nothing extra. GPUI uses Metal on macOS and DirectX on Windows, and `keyring`
+uses the platform-native backends (`apple-native`, `windows-native`), both of
+which ship with the OS.
+
+  </Tab>
+</Tabs>
+
+The same package list is installed in CI by the composite action at
+`.github/actions/linux-deps/action.yml`, which both the `lint` and `test` jobs
+reuse — the lint job needs it too, because `cargo clippy` type-checks the whole
+workspace and therefore still links every `-sys` crate.
+
+## Build
+
+<Steps>
+  <Step title="Clone">
+
+```sh
+git clone https://github.com/prdlk/starlet
+cd starlet
+```
+
+  </Step>
+  <Step title="Build and run">
+
+```sh
+cargo run --release
+```
+
+Or, through the task runner:
+
+```sh
+just run          # debug build against your real database
+just run-release  # optimised build against your real database
+```
+
+  </Step>
+  <Step title="Verify the workspace is healthy">
+
+```sh
+just ci   # fmt-check, clippy, tests, build — exactly what CI runs
+```
+
+  </Step>
+</Steps>
+
+::::tip[Debug builds are usable]
+`[profile.dev]` sets `opt-level = 1` for the workspace and `opt-level = 2` for
+all dependencies (root `Cargo.toml`). A debug build is fast enough to develop
+against — the performance budgets in
+`crates/core/tests/ranking_performance.rs` are measured in the debug profile
+precisely so they stay honest.
+::::
+
+## Where the data lives
+
+Starlet resolves its database path in exactly two steps, in
+`crates/app/src/main.rs:43-48`:
+
+1. `STARLET_DB`, if set, is used verbatim.
+2. Otherwise `starlet_store::default_database_path()` —
+   `ProjectDirs::from("dev", "starlet", "starlet")` joined with `starlet.db`.
+
+| Platform | Default path |
+| --- | --- |
+| Linux | `~/.local/share/starlet/starlet.db` |
+| macOS | `~/Library/Application Support/starlet/starlet.db` |
+| Windows | `%APPDATA%\starlet\data\starlet.db` |
+
+The store crate itself never reads the environment; see
+[Environment](/reference/environment) for every variable Starlet honours.
+
+## Signing in is optional
+
+Without a GitHub client ID Starlet still runs: it searches whatever is already
+in the local database, and tells you the ID is missing when you try to sign in.
+Two ways to get past that during development:
+
+- [**Seed a demo database**](/getting-started/demo-database) — 5 000 synthetic
+  stars, no account, no network. This is the right choice for working on search,
+  ranking, or the UI.
+- [**Register a GitHub App**](/getting-started/github-app) — a one-time setup
+  that gives you your real stars. Needed to work on `sync`.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Demo database" href="/getting-started/demo-database" icon="database">
+    Synthetic stars in one command.
+  </Card>
+  <Card title="GitHub App" href="/getting-started/github-app" icon="github">
+    Device flow, client ID, keychain.
+  </Card>
+  <Card title="AI providers" href="/getting-started/ai-providers" icon="sparkles">
+    Bring your own key, or run Ollama locally.
+  </Card>
+  <Card title="Development" href="/development" icon="terminal">
+    The task list, the test suite, the budgets.
+  </Card>
+</CardGroup>

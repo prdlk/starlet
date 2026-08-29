@@ -1,0 +1,408 @@
+---
+title: Add a view
+description: Add an overlay, a command-palette entry, and an async data path inside a GPUI view — including the revision guard that keeps stale answers off the screen.
+sidebar:
+  label: Add a view
+  icon: layout
+---
+
+Three related jobs, in the order you will hit them: a new overlay (a dialog or
+a sheet), the palette entry and action that reach it, and the async read that
+fills it with data. All three live entirely in `crates/ui`; nothing below `ui`
+knows a window exists.
+
+The two globals are `Backend` (`crates/ui/src/services.rs:22`) and `Session`
+(`crates/ui/src/services.rs:98`). Everything else — including your new view —
+is an `Entity<T>` owned by a view. Read [Runtime](/architecture/runtime) for
+why the async shape below is not negotiable, and [ui](/crates/ui) for the
+existing view inventory.
+
+## A new overlay
+
+The worked example is an export dialog: `crates/ui/src/export.rs`, opened from
+the palette and from `secondary-e`.
+
+<Steps>
+
+<Step title="Create crates/ui/src/export.rs with the open entry point">
+
+A view is a struct, an `impl Render`, and a free-standing `open` that puts it on
+a layer. Dialog pattern, from `crates/ui/src/settings.rs:70-76`:
+
+```rust crates/ui/src/export.rs
+pub struct ExportDialog {
+    owner: WeakEntity<SearchView>,
+    rows: Fetch<usize>,
+    _task: Option<Task<()>>,
+}
+
+impl ExportDialog {
+    pub fn open(owner: Entity<SearchView>, window: &mut Window, cx: &mut App) {
+        let view = cx.new(|cx| ExportDialog::new(owner, cx));
+        let content = view.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            dialog.title("Export").w(px(480.)).child(content.clone())
+        });
+    }
+}
+```
+
+For a side panel use a sheet instead — pattern at
+`crates/ui/src/detail.rs:48-54`:
+
+```rust crates/ui/src/export.rs
+        window.open_sheet(cx, move |sheet, _, _| {
+            sheet.size(px(520.)).child(content.clone())
+        });
+```
+
+The `content.clone()` inside the closure is not redundant: the closure is
+`Fn`, not `FnOnce`, so it may be called on every frame.
+
+</Step>
+
+<Step title="Declare the module — crates/ui/src/lib.rs:9-22">
+
+```rust crates/ui/src/lib.rs
+pub mod detail;
+pub mod export;
+pub mod filters;
+```
+
+Alphabetical. Only add a `pub use` at `crates/ui/src/lib.rs:24-27` if `app`
+needs the type by name — an overlay usually does not.
+
+</Step>
+
+<Step title="Take an owner and downgrade it, if it must talk back">
+
+Take `owner: Entity<SearchView>` in `open` and store `owner.downgrade()` — the
+pattern at `crates/ui/src/analyze.rs:61-63`.
+
+```rust crates/ui/src/export.rs
+    fn new(owner: Entity<SearchView>, cx: &mut Context<Self>) -> Self {
+        Self {
+            owner: owner.downgrade(),
+            rows: Fetch::Idle,
+            _task: None,
+        }
+    }
+```
+
+A `WeakEntity` is correct rather than merely tidy: an overlay can outlive the
+frame that opened it, and `owner.update(cx, …)` on a weak handle returns `Err`
+instead of panicking once the workspace is gone.
+
+::::info[Nothing else is needed for it to appear]
+`Root` renders only its child view, so the three overlay layers are composed
+once by the application root at `crates/ui/src/search.rs:1131-1133` — sheet,
+then dialog, then notification, in stacking order. A dialog you push with
+`window.open_dialog` shows up because that line already exists. There is no
+registry to add yourself to.
+::::
+
+</Step>
+
+<Step title="Add an action — crates/ui/src/actions.rs:16-41 and :45-98">
+
+Every command is an `Action` so the palette, the menus, and the keyboard
+dispatch the same thing.
+
+```rust crates/ui/src/actions.rs
+actions!(
+    starlet,
+    [
+        // …
+        OpenExport,
+    ]
+);
+```
+
+Then a binding in `bind_keys`, choosing the context deliberately: `CONTEXT`
+(`crates/ui/src/actions.rs:11`) for a workspace-wide command,
+`RESULTS_CONTEXT` (`:14`) for one that only makes sense while the table owns
+the keyboard.
+
+```rust crates/ui/src/actions.rs
+        KeyBinding::new("secondary-e", OpenExport, Some(CONTEXT)),
+```
+
+If `secondary-` would collide on a platform, add a `#[cfg(target_os = …)]`
+pair — `ToggleCommandPalette` at `crates/ui/src/actions.rs:53-56` is the worked
+example, and the reasoning is in
+[ADR 0011](/adr/platform-keybindings).
+
+</Step>
+
+<Step title="Write and register the handler — crates/ui/src/search.rs:716-750 and :1064-1081">
+
+The handler is a method on `SearchView` with the fixed action signature:
+
+```rust crates/ui/src/search.rs
+    fn open_export(&mut self, _: &OpenExport, window: &mut Window, cx: &mut Context<Self>) {
+        crate::export::ExportDialog::open(cx.entity(), window, cx);
+    }
+```
+
+Register it in the render chain, and import the action in the
+`use crate::actions::{…}` list at `crates/ui/src/search.rs:43-47`:
+
+```rust crates/ui/src/search.rs
+            .on_action(cx.listener(Self::open_export))
+```
+
+</Step>
+
+<Step title="Assert it reaches the layer — crates/ui/tests/overlays.rs">
+
+`has_dialog` (`crates/ui/tests/overlays.rs:82`) and `has_sheet` (`:86`) ask the
+window directly, so the test proves the overlay is really on the layer rather
+than merely constructed.
+
+```rust crates/ui/tests/overlays.rs
+#[gpui::test]
+async fn the_export_dialog_opens(cx: &mut TestAppContext) {
+    let (_view, cx) = boot(cx);
+    assert!(!has_dialog(cx));
+
+    cx.dispatch_action(OpenExport);
+    settle(cx);
+    assert!(has_dialog(cx), "export must reach the dialog layer");
+}
+```
+
+`settle` (`crates/ui/tests/overlays.rs:74-80`) alternates `run_until_parked`
+with short sleeps because a view that spawns background work is not parked
+after a single drain.
+
+</Step>
+
+</Steps>
+
+## A new command-palette entry
+
+Commands are *data* so the list, the keyboard, and the toolbar buttons cannot
+drift apart (`crates/ui/src/palette.rs:24-26`). Seven touch points, all in
+`crates/ui/src/palette.rs`:
+
+<Steps>
+
+<Step title="Add the Command variant — crates/ui/src/palette.rs:27-41">
+
+```rust crates/ui/src/palette.rs
+pub enum Command {
+    Sort(SortKey),
+    Filter { label: &'static str, query: &'static str },
+    Export,
+    // …
+}
+```
+
+A filter shortcut needs no new variant — `Command::Filter` is already
+parameterised by label and query string.
+
+</Step>
+
+<Step title="Add the label — crates/ui/src/palette.rs:44-59">
+
+```rust crates/ui/src/palette.rs
+            Command::Export => "Export results…".into(),
+```
+
+The trailing ellipsis is the convention for a command that opens an overlay
+rather than acting immediately — compare `"Settings…"` at
+`crates/ui/src/palette.rs:52`.
+
+</Step>
+
+<Step title="Add a query_hint, if it is a filter — crates/ui/src/palette.rs:65-69">
+
+Only `Command::Filter` returns a hint. The palette shows the query text beside
+the row so it teaches the query language instead of hiding it. Nothing to do
+for `Export`.
+
+</Step>
+
+<Step title="Add a bound_action, if a chord reaches it — crates/ui/src/palette.rs:76-83">
+
+```rust crates/ui/src/palette.rs
+            Command::Export => Some(Box::new(crate::actions::OpenExport)),
+```
+
+Returning the *action* rather than a formatted string means the row shows
+whatever is actually bound on this platform.
+
+</Step>
+
+<Step title="Pick a group — crates/ui/src/palette.rs:85-92">
+
+The match falls through to `"Actions"` (`crates/ui/src/palette.rs:90`), so a
+plain command needs nothing. Add an arm only for a genuinely new section.
+
+</Step>
+
+<Step title="Push it into all_commands — crates/ui/src/palette.rs:95-127">
+
+```rust crates/ui/src/palette.rs
+        Command::ClearFilters,
+        Command::Sync,
+        Command::Analyze,
+        Command::Export,
+        Command::ToggleSidebar,
+        Command::Settings,
+```
+
+`all_commands` takes `signed_in: bool`. Gate there if the command is
+session-dependent — that is how `SignIn`/`SignOut` become one row
+(`crates/ui/src/palette.rs:121-125`).
+
+</Step>
+
+<Step title="Implement execution in run — crates/ui/src/palette.rs:265-317">
+
+Two options, and the choice is the whole point of the function:
+
+```rust crates/ui/src/palette.rs
+        // Preferred: dispatch the action, so the handler stays the single
+        // implementation and the keyboard path is the same code.
+        Command::Export => window.dispatch_action(Box::new(actions::OpenExport), cx),
+
+        // Only when there is no action: reach the owner directly.
+        Command::ClearFilters => {
+            let _ = owner.update(cx, |view, cx| view.clear_filters(cx));
+        }
+```
+
+Dispatching keeps the palette from becoming a second source of truth
+(`crates/ui/src/palette.rs:263-264`).
+
+</Step>
+
+</Steps>
+
+## A new async data path
+
+Every read from SQLite inside a view has the same three-part shape. Deviating
+from it is how stale data reaches the screen.
+
+```rust crates/ui/src/export.rs
+    fn load_row_count(&mut self, cx: &mut Context<Self>) {
+        // 1. hop to the Tokio runtime through the Backend global
+        let store = Backend::global(cx).store();
+        let rx = Backend::global(cx).spawn(async move { store.repo_count().await });
+
+        // 2. await it back on the GPUI thread and update through `this`
+        self._task = Some(cx.spawn(async move |this, cx| {
+            let Ok(Ok(count)) = rx.await else { return };
+            let _ = this.update(cx, |this, cx| {
+                this.rows = Fetch::Ready(count as usize);
+                cx.notify();
+            });
+        }));
+    }
+```
+
+3. **Own the `Task`.** Store it in a `_`-prefixed field so its lifetime is tied
+to the view — dropping the view cancels the work — or `.detach()` for
+fire-and-forget. The canonical examples:
+
+| Shape | Where |
+| --- | --- |
+| detached read, no result to invalidate | `crates/ui/src/search.rs:189-199` |
+| revision-guarded, query-dependent | `crates/ui/src/search.rs:281-303` |
+| facet reload owned by a panel | `crates/ui/src/filters.rs:71-91` |
+
+::::danger[A query-dependent result MUST capture and re-check the revision counter]
+Capture the revision *before* spawning and compare it *inside* the update:
+
+```rust crates/ui/src/search.rs
+        let revision = self.revision;                    // search.rs:287
+        // …
+            let _ = this.update(cx, |this, cx| {
+                if this.revision != revision {           // search.rs:295
+                    return;
+                }
+                this.fts = hits;
+                this.rerank(Selection::Keep, cx);
+            });
+```
+
+Without it, a slow stage-two answer for `hel` lands after the user has typed
+`helix` and silently overwrites the newer results. This is the guard
+[ADR 0003](/adr/two-stage-search) is built on, and it lives in the view because
+`core` knows nothing about revisions.
+::::
+
+## Verify
+
+```sh
+just test-ui            # cargo test -p starlet-ui --test workspace --test overlays
+just test-crate ui      # adds the palette unit tests
+just test-one the_export_dialog_opens
+```
+
+The overlay and workspace tests are headless `#[gpui::test]`s — no display
+required. Details in [Testing](/development/testing).
+
+Safety nets:
+
+| Skipped step | What fails | Where |
+| --- | --- | --- |
+| a `Command` arm in `label`, `group`, or `run` | compile error: non-exhaustive match | `crates/ui/src/palette.rs:44`, `:85`, `:265` |
+| a filter shortcut whose query does not parse to a clause | `every_filter_shortcut_parses_into_a_clause` | `crates/ui/src/palette.rs:395` |
+| a new `SortKey` without a palette token | compile error: `sort_token` is exhaustive | `crates/ui/src/palette.rs:320-328` |
+| `pub mod` in `lib.rs` | compile error: unresolved module | `crates/ui/src/lib.rs:9-22` |
+| `.on_action` registration | **nothing.** The action dispatches into the void; the palette row does nothing. | — |
+| the overlay assertion | **nothing.** | — |
+
+The last two are why step 6 of the overlay walkthrough exists. `query_hint` and
+`bound_action` both have `_ => None` arms, so a missing entry compiles and the
+row simply renders without its hint or its chord.
+
+## Traps
+
+::::danger[A single `_task` field silently cancels the previous task]
+A view that assigns `self._task = Some(cx.spawn(…))` has exactly one task slot.
+Adding a *second* concurrent async path that assigns the same field drops the
+first `Task`, which cancels it — no warning, no log, just a load that never
+finishes. Give each concurrent path its own field, the way `SearchView` keeps
+`_fts_task` separate (`crates/ui/src/search.rs:283`), or hold a
+`Vec<Task<()>>`.
+::::
+
+**`Space` is `ShowDetail` only in `RESULTS_CONTEXT`.** The binding at
+`crates/ui/src/actions.rs:77` is scoped to the table, because in the search
+input a space is a space. Bind a printable key in `CONTEXT` and you break
+typing. A binding on an ancestor context never wins against one on the focused
+node — which is also why four movement keys are deliberately re-registered
+inside `Input` (`crates/ui/src/actions.rs:79-82`).
+
+**A filter-shortcut palette entry must parse to a clause with no leaked free
+text.** `every_filter_shortcut_parses_into_a_clause`
+(`crates/ui/src/palette.rs:395`) iterates every `Command::Filter` in
+`all_commands` and asserts its query string produces at least one clause and
+leaves `Query::terms` empty. A typo like `lang:` (empty value) or `langauge:rust`
+(unknown field) fails it, because the parser is total: a broken shortcut
+becomes a free-text search, not an error. See
+[Add a query prefix](/guides/add-a-query-prefix).
+
+**`window.open_dialog`'s closure is `Fn`, not `FnOnce`.** Clone the content
+entity inside the closure body, not before it. Moving a single clone in and
+using it directly will not compile, and working around that by capturing the
+entity without cloning leaks the view across frames.
+
+**`Backend::global(cx).spawn` is the only way to reach Tokio.** GPUI's executor
+and the two-worker `starlet-io` runtime are separate; `runtime.block_on` exists
+in exactly two places, both in `crates/app/src/main.rs` before the window
+exists. Calling a store method directly from a view will not compile, and
+blocking the GPUI thread to wait for one drops frames. See
+[Runtime](/architecture/runtime).
+
+**Do not add a third global.** [ADR 0005](/adr/tokio-runtime-bridge) fixes the
+count at two — `Backend` and `Session`. A new view's state belongs in an
+`Entity<T>` owned by whoever opens it; the moment it is a global, two views can
+disagree about who owns its lifetime.
+
+**`cx.notify()` is not implied by mutation.** `this.update` gives you `&mut
+Self`, and GPUI will not re-render because a field changed. Every async
+completion that changes something visible ends with `cx.notify()`.

@@ -1,0 +1,153 @@
+---
+title: app
+description: The hundred-line binary — logging, a Tokio runtime, the database, the persisted appearance, two globals, one window, and then nothing at all.
+sidebar:
+  label: app
+  icon: play
+---
+
+`starlet-app` is startup and nothing else. Its own doc comment
+(`crates/app/src/main.rs:1-5`) states the rule the crate is held to: *"Every
+decision past that point belongs to `starlet-ui`."* There are no views here, no
+product logic, and no place where one could be smuggled in — `fn main`
+(`crates/app/src/main.rs:24`) and `fn window_options`
+(`crates/app/src/main.rs:88`) are the whole file.
+
+The manifest enforces it. `crates/app/Cargo.toml` declares `[[bin]] starlet` and
+depends on `starlet-store`, `starlet-sync`, `starlet-ui`, `anyhow`, `gpui`,
+`gpui-component`, `tokio`, `tracing` and `tracing-subscriber` — and deliberately
+**not** on `starlet-core` or `starlet-ai`. The binary cannot name a `Repo`, a
+`Query`, or an `AiProvider`, so it genuinely cannot contain domain logic; both
+reach it only as opaque types re-exported through `starlet-ui`.
+
+## The startup sequence
+
+<Steps>
+
+<Step title="Install tracing">
+`tracing_subscriber::fmt` with an env filter read from `STARLET_LOG`, defaulting
+to `"starlet=info,warn"`, writing to stderr (`crates/app/src/main.rs:24-30`). See
+[Environment](/reference/environment).
+</Step>
+
+<Step title="Build the Tokio runtime">
+Multi-thread, `enable_all()`, `worker_threads(2)`, thread name `starlet-io`,
+wrapped in an `Arc` (`crates/app/src/main.rs:36-43`). Two workers, because this
+runtime exists to hold blocking work off the main thread, not to saturate the
+machine.
+</Step>
+
+<Step title="Resolve the database path">
+`STARLET_DB` if it is set, otherwise `starlet_store::default_database_path()`
+(`crates/app/src/main.rs:47-50`).
+</Step>
+
+<Step title="Open the store">
+`runtime.block_on(Store::open(&database))` (`crates/app/src/main.rs:51-53`).
+Migrations run inside `Store::open`, so this call is also the schema upgrade.
+</Step>
+
+<Step title="Read the persisted appearance">
+`runtime.block_on` a read of `settings::KEY_APPEARANCE`, through
+`settings::parse_appearance` (`crates/app/src/main.rs:57-66`). This happens
+**before the window exists**, on purpose: the appearance is an argument to
+`starlet_ui::init`, so the very first painted frame is already the right theme.
+Reading it after the window opened would paint one frame of the default dark
+theme and then flash to light.
+</Step>
+
+<Step title="Create the application with its assets">
+`Application::new().with_assets(starlet_ui::Assets).run(|cx| …)`
+(`crates/app/src/main.rs:68-69`). Everything from here runs on the GPUI main
+thread.
+</Step>
+
+<Step title="Initialise gpui-component">
+`crates/app/src/main.rs:70`. Must precede the next step — it creates the `Theme`
+global and the key contexts that `starlet_ui::init` then mutates.
+</Step>
+
+<Step title="Initialise starlet-ui">
+`crates/app/src/main.rs:71` — fonts, then theme, then keymap, in that order.
+</Step>
+
+<Step title="Set the Backend global">
+`cx.set_global(Backend::new(store, runtime))` (`crates/app/src/main.rs:73`).
+</Step>
+
+<Step title="Set the Session global">
+`cx.set_global(Session::restore())` (`crates/app/src/main.rs:74`) — a synchronous
+keychain read, because it decides what the first frame renders.
+</Step>
+
+<Step title="Activate">
+`cx.activate(true)` (`crates/app/src/main.rs:75`).
+</Step>
+
+<Step title="Open the window">
+`cx.open_window(window_options(cx), |window, cx| cx.new(|cx| Root::new(starlet_ui::workspace(window, cx), window, cx)))`,
+`.expect("open the main window")` (`crates/app/src/main.rs:77-83`).
+`gpui_component::Root` must be the first-level view or the overlay layers never
+resolve — see [`ui`](/crates/ui).
+</Step>
+
+</Steps>
+
+Steps 9 and 10 must both precede step 12: `SearchView::new` calls
+`Backend::global` on the first frame, and that accessor panics rather than
+returning an `Option`.
+
+## Window options
+
+`fn window_options(cx: &App) -> WindowOptions` (`crates/app/src/main.rs:88`):
+
+| Setting | Value | Cite |
+| --- | --- | --- |
+| `DEFAULT_SIZE` | `(1180.0, 760.0)`, centred | `main.rs:19` |
+| `MIN_SIZE` | `(720.0, 480.0)` | `main.rs:21` |
+| Titlebar | `"Starlet"`, traffic lights offset to `(12, 12)` | `main.rs:88` |
+| `app_id` | `"dev.starlet.Starlet"` | `main.rs:88` |
+
+The `app_id` is what a Linux desktop environment matches against a `.desktop`
+entry for the icon and window grouping, so it is not cosmetic.
+
+## The only two `block_on` calls in the workspace
+
+::::info[`crates/app/src/main.rs:50` and `crates/app/src/main.rs:55`]
+Those two lines are the complete inventory. Everywhere else — all of
+`crates/ui` included — I/O goes through `Backend::spawn` /
+`Backend::spawn_blocking` and is awaited inside `cx.spawn`, because blocking the
+GPUI main thread freezes the window.
+
+They are legitimate here for one reason: **neither `Application::new()` nor any
+window exists yet.** There is no frame to miss and no event loop to stall. There
+is also no alternative — `Store::open` must complete before the `Backend` global
+can be constructed, and the appearance must be known before
+`starlet_ui::init` is called. Both are one-shot startup facts, not ongoing work.
+
+Add a third `block_on` after `crates/app/src/main.rs:69` and you have a hang, not
+a slow launch. See [ADR 5](/adr/tokio-runtime-bridge) and
+[Runtime](/architecture/runtime).
+::::
+
+## Adding a startup step
+
+Everything belongs in `crates/app/src/main.rs`; there is no second file to
+consider.
+
+- **Blocking work that must finish before the window** goes before
+  `Application::new()`, using `runtime.block_on`, alongside the existing two
+  (`crates/app/src/main.rs:51-66`). Justify it against the rule above: it has to
+  be a fact the first frame depends on.
+- **Work that needs an `App`** goes inside the `run` closure, after
+  `starlet_ui::init` (`crates/app/src/main.rs:70-84`).
+
+::::warning[A new global is almost always the wrong answer]
+A third `cx.set_global(...)` would go at `crates/app/src/main.rs:73-74`, and
+[ADR 5](/adr/tokio-runtime-bridge) fixes the count at two — `Backend` and
+`Session` — precisely so that shared mutable state stays countable. A global is
+reachable from every view, invisible in every signature, and untestable in
+isolation; almost always what is actually wanted is an `Entity<T>` owned by the
+view that cares about it, which GPUI already scopes, notifies and tears down for
+you. If a second view needs it, hand it a `WeakEntity` rather than promoting it.
+::::

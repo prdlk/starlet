@@ -1,0 +1,73 @@
+---
+title: Extension guides
+description: Followable checklists for the five changes that touch more than one crate — a query prefix, a migration, a synced field, an AI provider, a view.
+sidebar:
+  label: Guides
+  icon: wrench
+---
+
+Most changes to Starlet are local to one file. These five are not: each one
+crosses a crate boundary, and each one has at least one step that fails
+*silently* if you skip it. Every guide below is a checklist with the exact
+`path:line` to touch, in dependency order, plus the test that catches the
+omission.
+
+Read [Architecture](/architecture) first if you have not — the layering rule
+(dependencies point downward, nothing below `ui` knows a window exists) is what
+makes these checklists the length they are.
+
+## Which guide do I need
+
+| I want to… | Guide |
+| --- | --- |
+| add a new filter to the search box (`topic:`, `license:`, `size:`) | [Add a query prefix](/guides/add-a-query-prefix) |
+| add a new sort order to the palette | [Add a query prefix](/guides/add-a-query-prefix) — same shape, `SortKey` instead of `Field` |
+| store a new column, or change the schema at all | [Add a migration](/guides/add-a-migration) |
+| add a new column to the full-text index | [Add a migration](/guides/add-a-migration) — the FTS5 section, not `ALTER TABLE` |
+| store a new field GitHub already sends | [Add a synced field](/guides/add-a-synced-field) |
+| support a fourth LLM backend | [Add an AI provider](/guides/add-an-ai-provider) |
+| add a dialog, a sheet, or a palette entry | [Add a view](/guides/add-a-view) |
+| load data from SQLite inside a view | [Add a view](/guides/add-a-view) — the async data path section |
+| change the ranking blend | nothing crosses a crate: two consts, derived in [Ranking](/reference/ranking) |
+
+<CardGroup cols={2}>
+  <Card title="Add a query prefix" href="/guides/add-a-query-prefix" icon="filter">
+    A new `field:value` token in the search box. Ten steps inside `core`, then
+    the palette and the syntax table.
+  </Card>
+  <Card title="Add a migration" href="/guides/add-a-migration" icon="database">
+    A new column that `load_repos` returns and sync writes — plus why an FTS
+    column is a table rebuild, not an `ALTER TABLE`.
+  </Card>
+  <Card title="Add a synced field" href="/guides/add-a-synced-field" icon="refresh-cw">
+    The six-step chain from GitHub's JSON to a rendered cell, and the refresh
+    path that blanks anything you forget to carry over.
+  </Card>
+  <Card title="Add an AI provider" href="/guides/add-an-ai-provider" icon="sparkles">
+    A fourth backend behind the `AiProvider` trait, its price table, and the
+    keyless/endpoint policy that keeps a settings typo from leaking a key.
+  </Card>
+  <Card title="Add a view" href="/guides/add-a-view" icon="layout">
+    A new overlay, a new command-palette entry, and the canonical shape of an
+    async read inside a GPUI view.
+  </Card>
+</CardGroup>
+
+## Ground rules that apply to all five
+
+::::warning[Three things that bite in every one of these changes]
+- **Positional decoding.** `RepoRow` is decoded by index, not by name
+  (`crates/store/src/repos.rs:40-63`). A column added to the SELECT but not to
+  the struct at the same position mis-decodes rather than erroring.
+- **A parser that runs on every keystroke must be total.** `query::parse`
+  cannot fail and cannot panic (`crates/core/src/query.rs:139`); a new prefix
+  either becomes free text or is skipped.
+- **A stale async answer must be discarded, not applied.** Any view result that
+  depends on the query has to re-check the revision counter
+  (`crates/ui/src/search.rs:295`). See [Runtime](/architecture/runtime).
+::::
+
+The task runner is `just`; the toolchain is pinned in `rust-toolchain.toml` and
+named nowhere else. Every guide's `## Verify` section uses
+`just test-crate <name>` and `just test-one <filter>`. The full test map is in
+[Testing](/development/testing).

@@ -1,0 +1,295 @@
+---
+title: Query syntax
+description: The complete query language — prefixes, star ranges, negation, quoting — and the exact behaviour of the total parser that reads it on every keystroke.
+sidebar:
+  label: Query syntax
+  icon: filter
+---
+
+`query::parse` (`crates/core/src/query.rs:139`) is **total**: it never fails and
+never panics. There is no `Result`, and there is no error type anywhere in
+`starlet-core`. That is not stylistic — the function runs against half-typed
+text on every keystroke, so its only two failure modes are "this token becomes
+free text" and "this token is skipped entirely". The property `never_panics`
+(`crates/core/tests/query_proptest.rs:22`) fuzzes 512 arbitrary strings per run
+to keep it that way.
+
+The first half of this page is the language. The second half is what the parser
+actually does with it, which is what you need when you add a prefix.
+
+## The grammar
+
+```text crates/core/src/query.rs:3-8
+query   := item (ws+ item)*
+item    := '-'? (field ':' value) | word
+field   := lang | language | tag | group | owner | user | stars | is | sort
+value   := '"' … '"' | word
+```
+
+## Prefixes
+
+Field names are resolved by `Field::parse` (`crates/core/src/query.rs:62-74`)
+after the left side of the colon is lowercased, so every name below is
+case-insensitive. Anything not in this table is not a prefix, and the token
+falls through to free text.
+
+| Prefix | Matches | Example |
+| --- | --- | --- |
+| `lang:` `language:` | `primary_language` **or any key of `languages`** — a repository with one byte of Rust matches `lang:rust` (`query.rs:354-358`) | `lang:zig` |
+| `tag:` | any tag from any of the three sources, **or a GitHub topic** — topics are searchable as tags without being mirrored into `tags` (`query.rs:360-361`) | `tag:cli` |
+| `group:` | an AI group name (`query.rs:363`) | `group:"terminal tools"` |
+| `owner:` `user:` | the account name, exactly, case-insensitively. No substring matching (`query.rs:364`) | `owner:BurntSushi` |
+| `stars:` | a star range — see below (`query.rs:365`) | `stars:>=1k` |
+| `is:` | `archived`, `active`, `fork`, `source` (`query.rs:188-196`) | `is:source` |
+| `sort:` | sets the result ordering. Produces **no clause** (`query.rs:157`) | `sort:recent` |
+
+The same list, as the strings the command palette offers for completion, lives
+in `Field::ALL` (`crates/core/src/query.rs:76`). Its length is hard-coded at
+`7`, so adding a prefix without extending the array is a compile error — the
+intended safety net.
+
+## Star ranges
+
+`parse_star_range` (`crates/core/src/query.rs:259`) tries these six forms **in
+this order**, and returns `None` — which makes the whole token free text — if
+none of them fits.
+
+| # | Form | Yields | Cite |
+| --- | --- | --- | --- |
+| 1 | `lo..hi` | `{min: lo, max: hi}`. Either side may be empty for an unbounded end; **both empty is rejected** | `query.rs:261-276` |
+| 2 | `>=n` | `{min: n, max: none}` | `query.rs:277-282` |
+| 3 | `<=n` | `{min: none, max: n}` | `query.rs:283-288` |
+| 4 | `>n` | `{min: n+1 saturating, max: none}` | `query.rs:289-294` |
+| 5 | `<n` | `{min: none, max: n−1 saturating}` | `query.rs:295-300` |
+| 6 | `n` | `{min: n, max: n}` — an exact match | `query.rs:301-305` |
+
+Both ends are **inclusive**; `StarRange::contains` uses `is_none_or`, so a
+default range with both bounds `None` contains everything
+(`crates/core/src/query.rs:89`). Two properties pin this down:
+`star_ranges_are_inclusive` asserts both endpoints match and `lo-1`/`hi+1` do
+not (`crates/core/tests/query_proptest.rs:91`), and
+`strict_and_inclusive_bounds_agree` asserts `>n` and `>=n+1` produce identical
+clauses (`:106`).
+
+The order is load-bearing. `>=` is checked before `>` and `<=` before `<`, so
+the two-character forms win. And the `..` split runs **first**, which means
+`stars:>1..5` splits on `..`, then fails to parse `>1` as a count, returns
+`None`, and the entire token `stars:>1..5` lands in the result list as free
+text.
+
+### Count suffixes
+
+`parse_count` (`crates/core/src/query.rs:309`) trims, rejects empty, then
+inspects the **last byte** for a magnitude suffix (`query.rs:314-318`):
+
+| Suffix | Scale |
+| --- | --- |
+| `k` or `K` | ×1 000 |
+| `m` or `M` | ×1 000 000 |
+
+Byte-indexing is safe because `&s[..s.len()-1]` is only taken when that last
+byte is ASCII.
+
+**Without a suffix** the value must parse as an `i64` and be `>= 0`
+(`query.rs:322-323`) — so a bare `1.5` is rejected and `stars:1.5` becomes free
+text.
+
+**With a suffix** the digits are parsed as `f64`, which must be finite, `>= 0.0`
+and `<= 1e12`, and the product is then truncated (`query.rs:325-329`). So
+`stars:1.5k` is exactly `1500`, and `stars:1e13k` is rejected.
+
+## `is:` values
+
+| Token | Filter emitted | Net effect plain | Net effect negated |
+| --- | --- | --- | --- |
+| `archived` | `Filter::Archived(true)` | `is:archived` → archived only | `-is:archived` → not archived |
+| `active` | `Filter::Archived(negated)` | `is:active` → not archived | `-is:active` → **not archived** (unchanged) |
+| `fork` | `Filter::Fork(true)` | `is:fork` → forks only | `-is:fork` → non-forks |
+| `source` | `Filter::Fork(negated)` | `is:source` → non-forks | `-is:source` → **non-forks** (unchanged) |
+
+All four live in one match arm at `crates/core/src/query.rs:188-196`; the value
+is lowercased first, and anything else returns `NotAValue`.
+
+`archived` and `fork` emit a **constant** polarity (`crates/core/src/query.rs:189`,
+`:193`), so the clause's own negation flips them and both spellings behave as
+you would expect. `active` and `source` instead bake the negation into the
+filter value (`:192`, `:194`), and that is where the surprise lives.
+
+Polarity is recorded in **two** places:
+
+1. `apply` bakes the clause's own negation into the filter value —
+   `"active" => Filter::Archived(negated)` (`crates/core/src/query.rs:192`),
+   `"source" => Filter::Fork(negated)` (`:194`).
+2. `Clause::negated` is applied **again** at evaluation time:
+   `Query::matches` requires `filter.matches(repo) != clause.negated`
+   (`crates/core/src/query.rs:347`).
+
+Written as boolean algebra, a clause admits a repository when
+`matches XOR negated`. Walk both forms of `is:active` through it:
+
+| Typed | `negated` | Filter emitted | `matches` | `matches XOR negated` |
+| --- | --- | --- | --- | --- |
+| `is:active` | `false` | `Archived(false)` | `¬archived` | `¬archived` |
+| `-is:active` | `true` | `Archived(true)` | `archived` | `¬archived` |
+
+Step by step for `-is:active`: the leading `-` is stripped and `negated`
+becomes `true` (`crates/core/src/query.rs:143-147`); `apply` sees `active` with
+`negated == true` and therefore emits `Filter::Archived(true)` (`:192`); at
+evaluation an archived repository gives `matches == true`, and
+`true != true == false`, so it is filtered out, while a non-archived repository
+gives `false != true == true` and survives. The two flips cancel.
+
+::::warning[Verified drift]
+Two comments in the source assert an intent the code does not implement. The
+comment at `crates/core/src/query.rs:190-191` says the outer negation "flips
+whichever polarity we produce here", and the test comment at
+`crates/core/src/query.rs:480-481` says `-is:active` "must mean archived".
+Evaluation at `crates/core/src/query.rs:347` makes it a **no-op** instead:
+`-is:active` selects exactly the same repositories as `is:active`, and
+`-is:source` the same as `is:source`.
+
+The test `is_active_is_the_inverse_of_archived`
+(`crates/core/src/query.rs:477`) passes anyway because it only asserts the
+**shape** of the emitted `Clause` — it never evaluates one against a `Repo`.
+
+**Use `is:archived` and `-is:archived`.** Those two are reliable, because
+`crates/core/src/query.rs:189` emits a constant. The same holds for `is:fork`
+and `-is:fork` (`:193`).
+::::
+
+::::info[Reading `clause.filter` alone tells you nothing]
+Because polarity is split across `apply` and `Clause::negated`, you cannot
+inspect a `Filter` and conclude what the user asked for. A new `Field` arm
+should emit a constant polarity and let `Clause::negated` do the flipping —
+that is the composition rule the rest of the parser follows.
+::::
+
+## `sort:` values
+
+| `SortKey` | Accepted tokens | Display label |
+| --- | --- | --- |
+| `Relevance` | `relevance`, `best` | `Relevance` |
+| `Stars` | `stars` | `Stars` |
+| `Name` | `name`, `alpha` | `Name` |
+| `Recent` | `recent`, `pushed`, `updated` | **`Last commit`** |
+| `Starred` | `starred`, `added` | **`Recently starred`** |
+
+Tokens from `SortKey::parse` (`crates/core/src/query.rs:108-117`), labels from
+`SortKey::label` (`:119-127`). Two labels deliberately do not match their
+variant names: `Recent` reads as "Last commit" and `Starred` as "Recently
+starred", because the identifier describes the column and the label describes
+what a person is looking for.
+
+`sort:` produces **no clause**. `Applied::Sort` assigns `query.sort` by plain
+assignment (`crates/core/src/query.rs:157`), so with several `sort:` prefixes in
+one query the **last one wins** (test at `crates/core/src/query.rs:503`). The
+value is lowercased before lookup (`:197`); an unrecognised token returns
+`NotAValue` and survives as free text.
+
+`SortKey::parse` is private (`crates/core/src/query.rs:108`). The UI cannot call
+it and round-trips through `query::parse("sort:<token>")` instead
+(`crates/ui/src/palette.rs:382`).
+
+## Negation
+
+A leading `-` negates the item. It is stripped **before** field splitting
+(`crates/core/src/query.rs:143-147`), which is why `-tag:"x y"` works: by the
+time `split_field` runs, the body is already `tag:"x y"`.
+
+A **lone `-` is free text**, not a negation — the guard is
+`Some(rest) if !rest.is_empty()` (`crates/core/src/query.rs:145`), tested by
+`lone_dash_is_text` (`:498`). The property `negation_inverts_matching` asserts
+that `-p:v` and `p:v` always disagree for every prefix
+(`crates/core/tests/query_proptest.rs:69`).
+
+## Quoting and escaping
+
+`tokenize` (`crates/core/src/query.rs:212`) is a hand-rolled character scanner
+with four state variables. Its exact rules:
+
+| Rule | Cite |
+| --- | --- |
+| `\` sets the escape flag **only inside quotes**. Outside quotes a backslash is an ordinary character | `query.rs:226` |
+| When escaped, the next character is pushed verbatim and the flag clears — so `"a\"b"` is one token containing a literal `"` | `query.rs:220-224` |
+| `"` toggles quoting, marks the token non-empty, **and is itself pushed into the token** | `query.rs:227-231` |
+| Unquoted whitespace terminates the token — `char::is_whitespace`, so any Unicode space. Runs of whitespace therefore collapse, and leading/trailing whitespace produces nothing | `query.rs:232-237` |
+| An unterminated quote is **not an error**: `in_quotes` stays true to end of input and the trailing token is flushed | `query.rs:244-246` |
+| Tokens that are empty, exactly `"`, or exactly `""` are discarded at the end | `query.rs:247` |
+
+That last rule is why a stray quote character can never produce an empty term,
+which `terms_are_well_formed` asserts
+(`crates/core/tests/query_proptest.rs:29`).
+
+Quotes survive tokenization and are stripped later by `unquote`
+(`crates/core/src/query.rs:252-256`), which removes **one** leading `"` and
+**one** trailing `"`, **independently** — it does not require a matched pair.
+`"abc` becomes `abc`; `a"b` stays `a"b`.
+
+### Quoting is the escape hatch for a literal `field:value`
+
+Because the quotes are still attached when the token reaches `split_field`, a
+quoted token like `"lang:rust"` splits on its first colon into the name
+`"lang` — with the quote character — which `Field::parse` does not recognise.
+The whole token falls through to free text and is unquoted on the way out
+(`crates/core/src/query.rs:163`). So:
+
+| Typed | Effect |
+| --- | --- |
+| `lang:rust` | a `Filter::Language("rust")` clause |
+| `"lang:rust"` | the free-text term `lang:rust`, searched as prose |
+
+## Evaluation semantics
+
+- **Clauses are ANDed.** `Query::matches` requires every clause to agree
+  (`crates/core/src/query.rs:344-348`).
+- **An empty clause list matches everything** — `Iterator::all` on an empty
+  iterator is `true`.
+- **Free text is scored, never filtered.** `Query::matches` ignores `terms`
+  entirely; the terms reach the ranker as the fuzzy needle and the FTS query.
+  See [Ranking](/reference/ranking).
+- **Every string comparison is `eq_ignore_ascii_case`**
+  (`crates/core/src/query.rs:352-368`). Non-ASCII case is **not** folded, so
+  `tag:CAFÉ` will not match a tag stored as `café`.
+- **Sidebar facets are a separate layer.** Selected tags and groups are ORed
+  within a facet and ANDed across facets (`crates/ui/src/filters.rs:36`), and
+  that predicate is applied outside `starlet-core` alongside
+  `Query::matches`.
+
+## Parser edge cases
+
+| Input | Result | Why |
+| --- | --- | --- |
+| `lang:` | **Nothing at all.** `parse("lang:").is_empty()` is `true` | An empty value is skipped — neither clause nor text — so a half-typed prefix cannot blank the result list (`query.rs:151-154`; test `:459`; property `incomplete_prefixes_are_inert` at `tests/query_proptest.rs:114`) |
+| `stars:banana` | The free-text term `stars:banana` | `NotAValue` pushes the **raw** token — before dash-stripping and without `unquote` — so `-stars:banana` becomes the literal term `-stars:banana` (`query.rs:160`; test `:452`) |
+| `owner:a:b` | `Filter::Owner("a:b")` | `split_once(':')` splits on the **first** colon only; every later colon lands in the value (`query.rs:206`) |
+| `LANGUAGE:Rust` | `Filter::Language("Rust")` | Field **names** are lowercased before lookup (`query.rs:207`); field **values** are not, except for `is:` and `sort:` which lowercase explicitly (`:188`, `:197`). Case-insensitivity at match time comes from `eq_ignore_ascii_case`, not from normalising here (test `:411`) |
+| `-` | The free-text term `-` | A lone dash is text, not a negation (`query.rs:145`; test `:498`) |
+| `sort:name sort:stars` | `SortKey::Stars` | Plain assignment, so the last `sort:` wins (`query.rs:157`; test `:503`) |
+
+## Properties
+
+`crates/core/tests/query_proptest.rs` runs eight properties at 512 cases each
+(`ProptestConfig::with_cases(512)`, `:18`). A `safe_value()` strategy (`:13`)
+generates values that cannot be confused with syntax.
+
+| Property | Guarantees | Cite |
+| --- | --- | --- |
+| `never_panics` | `parse` survives any string up to 200 arbitrary characters | `:22` |
+| `terms_are_well_formed` | no term is ever empty, and `text == terms.join(" ")` | `:29` |
+| `free_text_is_idempotent` | re-parsing `query.text` is a fixed point | `:41` |
+| `known_prefixes_never_leak_into_text` | a recognised prefix with a valid value never also appears as free text | `:50` |
+| `negation_inverts_matching` | `-p:v` and `p:v` always disagree | `:69` |
+| `star_ranges_are_inclusive` | both endpoints match; `lo-1` and `hi+1` do not | `:91` |
+| `strict_and_inclusive_bounds_agree` | `>n` and `>=n+1` produce identical clauses | `:106` |
+| `incomplete_prefixes_are_inert` | `<field>:` yields an empty query for all seven field names | `:114` |
+
+`free_text_is_idempotent` is the one with a direct product consequence: the
+command palette rewrites the contents of the search input when you pick a
+command, and the fixed point is what guarantees that rewriting a parsed query
+back into the box does not change what it means.
+
+## See also
+
+- [Ranking](/reference/ranking) — what happens to the free text after parsing.
+- [`core`](/crates/core) — the crate that owns `parse`, `Filter`, and `Ranker`.
+- [Add a query prefix](/guides/add-a-query-prefix) — the end-to-end checklist.

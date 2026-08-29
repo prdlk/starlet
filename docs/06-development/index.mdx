@@ -1,0 +1,154 @@
+---
+title: Development
+description: The task runner, the underlying cargo commands, the pinned toolchain, and what to run before pushing.
+sidebar:
+  label: Development
+  icon: terminal
+---
+
+Tasks run through [`just`](https://github.com/casey/just). `just` on its own
+lists everything.
+
+## Before you push
+
+```sh
+just ci
+```
+
+That is `fmt-check`, `lint`, `test`, `build` — the same four steps CI runs, in the
+same order. The underlying commands, if you prefer them plain:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --locked
+```
+
+`--locked` everywhere is deliberate: a GPUI point release must be a reviewed
+`Cargo.lock` change, never a silent CI upgrade. See
+[ADR 1](/adr/published-gpui-crates).
+
+## The task list
+
+### Build and run
+
+| Task | Does |
+| --- | --- |
+| `just build` | `cargo build --workspace --locked` |
+| `just release` | Optimised build. What `just install` and packagers use. |
+| `just run *ARGS` | Run against your real database. |
+| `just run-release *ARGS` | Optimised, against your real database. |
+| `just install` | `cargo install --path crates/app --locked` |
+
+### Demo
+
+| Task | Does |
+| --- | --- |
+| `just seed [count] [db]` | Fill a throwaway database with synthetic stars. Defaults: 5 000 into `/tmp/starlet-demo.db`. |
+| `just demo [count] [db]` | Seed, then launch against it. No GitHub account needed. |
+| `just demo-clean [db]` | Delete the throwaway database and its `-shm`/`-wal` sidecars. |
+
+See [Demo database](/getting-started/demo-database).
+
+### Checks
+
+| Task | Does |
+| --- | --- |
+| `just ci` | Everything CI runs, in CI's order. |
+| `just check` | `cargo check --workspace --all-targets --locked` — the fastest useful feedback. |
+| `just lint` | Clippy with warnings denied. |
+| `just fmt` / `just fmt-check` | Apply rustfmt / fail if anything is unformatted. |
+| `just fix` | Apply the clippy fixes that can be applied mechanically. |
+
+`--all-targets` on both `check` and `lint` is what keeps tests, benches, and
+`crates/store/examples/seed.rs` linted — exactly the places unreviewed code tends
+to accumulate.
+
+### Tests
+
+| Task | Does |
+| --- | --- |
+| `just test` | The whole suite — 181 tests. |
+| `just test-crate <crate>` | One crate: `just test-crate core`. |
+| `just test-one <filter>` | Tests matching a name, with `--nocapture`. |
+| `just test-ui` | The GPUI interaction and overlay tests. Headless; no display required. |
+| `just bench` | The wall-clock budgets, with the measured numbers printed. |
+
+See [Testing](/development/testing).
+
+### Docs
+
+| Task | Does |
+| --- | --- |
+| `just docs` | `cargo doc --workspace --no-deps --open` — the rustdoc API reference. |
+| `bun run dev` | This site, with hot reload. |
+| `bun run build` | This site, static, into `dist/`. |
+
+::::warning[`blume build` and a running `blume dev` collide]
+Both regenerate the same `.blume/` runtime. Either stop the dev server, or use
+`--isolated`, which relocates the runtime to `.blume-verify/`:
+
+```sh
+bunx blume check --isolated   # fast: type-check config and .astro changes
+bunx blume build --isolated   # thorough: full production render
+```
+
+Setting `BLUME_RUNTIME_DIR=.blume-verify` makes plain `build`/`check` isolate
+without the flag. The CI workflow does exactly that.
+::::
+
+### Upkeep
+
+| Task | Does |
+| --- | --- |
+| `just clean` | `cargo clean` |
+| `just tree <crate>` | Reverse dependency tree: `just tree gpui`. |
+| `just outdated` | Requires `cargo-outdated`. |
+| `just audit` | Advisory audit. Requires `cargo-audit`. |
+
+## The toolchain is pinned, and named once
+
+`rust-toolchain.toml` pins channel `1.98.0` plus `rustfmt` and `clippy`.
+**Nothing else names a version** — not the `Justfile`, not the CI workflow.
+`rustup` applies the override automatically for any `cargo`/`rustc` call inside
+the checkout.
+
+::::danger[Never install a second toolchain]
+Naming a toolchain in a setup action installs one the override then ignores — or
+worse, silently shadows the pin. CI does
+`rustup show active-toolchain || rustup toolchain install` instead, which reads
+`rust-toolchain.toml`. Since rustup 1.28 a bare `rustup show` no longer installs
+a missing override toolchain, hence the fallback.
+::::
+
+## Profiles
+
+```toml Cargo.toml
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+```
+
+Dependencies are optimised harder than the workspace, which keeps incremental
+rebuilds fast without making the app sluggish. The performance budgets in
+`crates/core/tests/ranking_performance.rs` are measured in the **debug** profile
+on purpose, so they stay honest about what a developer actually runs.
+
+## Read next
+
+<CardGroup cols={2}>
+  <Card title="Testing" href="/development/testing" icon="flask-conical">
+    The suite layout, headless GPUI, wiremock, proptest, and the budgets.
+  </Card>
+  <Card title="CI and docs" href="/development/ci" icon="git-branch">
+    Both workflows, and how this site is built and published.
+  </Card>
+</CardGroup>

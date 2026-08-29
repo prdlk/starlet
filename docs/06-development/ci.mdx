@@ -1,0 +1,214 @@
+---
+title: CI and docs
+description: The two GitHub Actions workflows — the Rust matrix and the docs site — including why the toolchain is never named and how this site is published to Pages.
+sidebar:
+  label: CI and docs
+  icon: git-branch
+---
+
+Two workflows, deliberately independent. A Rust-only commit does not rebuild the
+docs; a docs-only commit does not spend three platforms of cold Rust builds.
+
+## `ci.yml` — the Rust workflow
+
+Triggers on pushes to `main` and on every pull request. Concurrency group
+`ci-${{ github.ref }}` with `cancel-in-progress: true` — a force-push or a new
+commit makes the in-flight run worthless, and cancelling it is cheaper than
+paying for three platforms twice.
+
+### `lint` job
+
+Single platform on purpose: rustfmt output and clippy lints are decided by the
+pinned toolchain, not by the host OS, so a matrix buys nothing.
+
+```yaml
+- uses: actions/checkout@v4
+- uses: ./.github/actions/linux-deps
+- name: Install pinned toolchain from rust-toolchain.toml
+  run: |
+    rustup show active-toolchain || rustup toolchain install
+    rustup show
+- uses: Swatinem/rust-cache@v2
+- run: cargo fmt --all --check
+- run: cargo clippy --workspace --all-targets --locked -- -D warnings
+```
+
+The `linux-deps` step is needed even for linting: `cargo clippy` type-checks the
+whole workspace, which means every `-sys` crate's build script still runs and
+every native library still links.
+
+### `test` job
+
+A three-way matrix — `ubuntu-latest`, `macos-latest`, `windows-latest` — with
+`fail-fast: false`, because a macOS-only or Windows-only linking failure is the
+most likely kind of breakage in this workspace and stopping at the first one hides
+the rest.
+
+`Swatinem/rust-cache@v2` is keyed per platform (`key: ${{ matrix.os }}`); target
+directories are not portable across OSes and a shared key would thrash on every
+run.
+
+Two steps, not one:
+
+```yaml
+- run: cargo test --workspace --locked
+- run: cargo build --workspace --locked
+```
+
+`cargo test` never builds the `starlet` binary itself — `crates/app` has no
+tests — so without the second step a break in `main.rs` would reach `main`
+unnoticed.
+
+Only Linux installs packages. macOS and Windows link against system frameworks
+that ship with the runner image, and `keyring` uses `apple-native` /
+`windows-native` there.
+
+### The composite action
+
+`.github/actions/linux-deps/action.yml` exists so the two jobs cannot drift apart
+on the package list. It carries a per-package justification, with `Cargo.lock` as
+the source of truth:
+
+| Package | Why |
+| --- | --- |
+| `clang`, `libclang-dev` | `bindgen` (transitive) needs libclang at build time. |
+| `cmake`, `build-essential` | `cc`-driven C builds, notably the bundled SQLite amalgamation from `libsqlite3-sys`. |
+| `libvulkan-dev` | `ash`/blade-graphics is GPUI's Linux rendering backend. |
+| `libxkbcommon-dev`, `libxkbcommon-x11-dev` | The `xkbcommon` crate **links** these; it does not dlopen them. |
+| `libwayland-dev`, `libx11-dev`, `libxcb1-dev` | GPUI compiles both its Wayland and X11 backends. |
+| `libfontconfig1-dev` | `yeslogic-fontconfig-sys` links libfontconfig. |
+| `libdbus-1-dev` | `keyring`'s `sync-secret-service` backend resolves to `dbus-secret-service` → `libdbus-sys` via pkg-config. |
+
+Two deliberate absences, both worth preserving:
+
+- **`libssl-dev`** — `reqwest` is configured with `rustls-tls` and
+  `default-features = false`, and no `openssl-sys` appears in `Cargo.lock`.
+- **`mesa-vulkan-drivers`** — no test opens a real Vulkan device. The GPUI tests
+  use the `test-support` platform layer.
+
+### No toolchain is named anywhere
+
+`rust-toolchain.toml` pins the channel and the components, and `rustup` applies
+that override automatically inside the checkout. The workflow step exists only to
+make the download an explicit, separately-timed line in the log.
+
+::::danger[Do not add a setup-rust action]
+`dtolnay/rust-toolchain@stable` would install a second toolchain that the
+override then ignores — or worse, silently shadow the pin. The
+`rustup show active-toolchain || rustup toolchain install` fallback exists because
+since rustup 1.28 a bare `rustup show` no longer installs a missing override
+toolchain.
+::::
+
+## `docs.yml` — this site
+
+Triggers on pushes to `main` and pull requests **scoped by path** — `docs/**`,
+`public/**`, `blume.config.ts`, `package.json`, `bun.lock`, `tsconfig.json`, and
+the workflow itself — plus `workflow_dispatch`, which is how you republish after
+changing a Pages setting (that touches no file and would otherwise never
+trigger).
+
+### `build` job
+
+<Steps>
+  <Step title="Checkout with full history">
+
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+```
+
+`lastModified: true` in `blume.config.ts` derives each page's date from git
+history. A shallow clone has no history, so every page would be stamped with the
+tip commit's date.
+
+  </Step>
+  <Step title="Install Bun and dependencies">
+
+`bun install --frozen-lockfile`, so a lockfile that has drifted from
+`package.json` fails the build rather than silently resolving something else.
+
+  </Step>
+  <Step title="Four gates, cheapest first">
+
+```yaml
+- run: bunx blume check
+- run: bunx blume validate --strict
+- run: bunx blume build
+- run: bunx blume audit
+```
+
+| Gate | Catches |
+| --- | --- |
+| `blume check` | Type errors in `blume.config.ts` and any authored `.astro` page. Fails on a config typo before the slow render starts. |
+| `blume validate --strict` | Broken internal links and missing heading anchors. `--strict` promotes warnings — a dead anchor is the failure mode that most easily survives a green build. |
+| `blume build` | Frontmatter validation (an unknown key is an error), MDX compile errors, and the render itself. |
+| `blume audit` | Reads the rendered HTML in `dist/` for SEO and site-health problems. Fails on errors; advisory warnings stay in the log. |
+
+  </Step>
+  <Step title="Upload the artifact">
+
+`actions/upload-pages-artifact@v3` with `path: dist`, gated on
+`github.event_name != 'pull_request'` — a PR stops at the four gates.
+
+  </Step>
+</Steps>
+
+`BLUME_RUNTIME_DIR: .blume-verify` is set workflow-wide so every command uses the
+isolated runtime. It costs nothing in CI and means the workflow and a local
+`blume dev` session can never contend over the same generated Astro project.
+
+### `deploy` job
+
+Needs `build`, skipped on pull requests, and the only job with elevated
+permissions:
+
+```yaml
+permissions:
+  pages: write      # mint the deployment
+  id-token: write   # sign the artifact attestation
+environment:
+  name: github-pages
+  url: ${{ steps.deployment.outputs.page_url }}
+```
+
+The `build` job keeps `contents: read` and nothing else.
+
+### One-time repository setup
+
+**Settings → Pages → Build and deployment → Source: GitHub Actions.** Without
+that, `actions/deploy-pages@v4` fails with a "Pages is not enabled" error. The
+default branch-based source is not compatible with an artifact deploy.
+
+### Why `deployment.base` is set
+
+Starlet's docs are a GitHub Pages **project** site, served from
+`https://prdlk.github.io/starlet`. GitHub Pages exposes no environment variable
+Blume could detect the origin from, so `blume.config.ts` sets both halves
+explicitly:
+
+```ts blume.config.ts
+deployment: {
+  output: "static",
+  site: "https://prdlk.github.io",
+  base: "/starlet",
+}
+```
+
+`site` is the origin — it makes the sitemap, canonical tags, and Open Graph
+images absolute. `base` is the subdirectory the whole site moves under, and Blume
+rewrites internal links and assets to include it. Write links as if mounted at
+the root; do not hand-write `/starlet` into a page.
+
+## Building the site locally
+
+```sh
+bun install
+bun run dev      # http://localhost:3000, hot reload
+bun run build    # static output into dist/
+bun run preview  # serve dist/ exactly as a static host would
+```
+
+If a `blume dev` server is already running, use `--isolated` for verification —
+see [Development](/development#docs).

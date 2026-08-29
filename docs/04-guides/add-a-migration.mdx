@@ -1,0 +1,286 @@
+---
+title: Add a migration
+description: Add a schema change that survives existing installs — a new repos column the loader returns and sync writes, and why an FTS column is a table rebuild.
+sidebar:
+  label: Add a migration
+  icon: database
+---
+
+A schema change is one new SQL file plus five edits in `crates/store/src/repos.rs`
+that must agree with each other positionally. Nothing registers the migration:
+`sqlx::migrate!("./migrations")` (`crates/store/src/lib.rs:111`) embeds every
+file in the directory at compile time and applies them in filename order.
+
+The worked example is an `open_issues` column that `load_repos` returns and the
+sync engine writes. The schema it extends is documented in
+[Database schema](/reference/database-schema); the crate is
+[store](/crates/store).
+
+<Steps>
+
+<Step title="Create crates/store/migrations/0002_add_open_issues.sql">
+
+Number it, snake-case the rest, and give the column a `NOT NULL DEFAULT` so
+existing rows are valid the instant the `ALTER TABLE` returns.
+
+```sql crates/store/migrations/0002_add_open_issues.sql
+-- Open-issue count from the star listing. 0 means "none" and also "not yet
+-- refreshed"; the two are indistinguishable, which is acceptable here.
+ALTER TABLE repos ADD COLUMN open_issues INTEGER NOT NULL DEFAULT 0;
+```
+
+No registration list to edit. But because `sqlx::migrate!` is a macro that
+embeds the directory at compile time, a build that has already seen the old
+directory will not notice a *new* file until `crates/store` is recompiled.
+
+</Step>
+
+<Step title="Never edit 0001_init.sql — crates/store/migrations/0001_init.sql">
+
+::::danger[Editing an applied migration bricks every existing install]
+sqlx records a checksum for each applied migration. Change one byte of
+`0001_init.sql` and every database that already ran it fails on open with
+`StoreError::Migrate` (`crates/store/src/lib.rs:38`) — forever, on every
+launch, with no way forward short of deleting the file. Your own machine will
+look fine if you happen to test against a fresh database.
+::::
+
+This applies to the whole file, comments and whitespace included. A correction
+to `0001_init.sql` is a *new* migration that corrects it.
+
+</Step>
+
+<Step title="Append to REPO_COLUMNS — crates/store/src/repos.rs:65-67">
+
+`REPO_COLUMNS` is the single source of truth for the SELECT order that every
+read path shares.
+
+```rust crates/store/src/repos.rs
+const REPO_COLUMNS: &str = "id, node_id, full_name, name, owner, html_url, description, \
+     stargazers, last_commit_at, primary_language, languages_json, contributors_json, \
+     starred_at, archived, fork, topics_json, updated_at, synced_at, open_issues";
+```
+
+Append. Inserting in the middle is legal but shifts every index below it in the
+next two steps.
+
+</Step>
+
+<Step title="Add the RepoRow field — crates/store/src/repos.rs:19-38">
+
+`RepoRow` is the raw row, before timestamp parsing and JSON decoding. Its field
+*order* is the contract.
+
+```rust crates/store/src/repos.rs
+struct RepoRow {
+    // …
+    updated_at: Option<String>,
+    synced_at: Option<String>,
+    open_issues: i64,
+}
+```
+
+</Step>
+
+<Step title="Add the try_get at the matching index — crates/store/src/repos.rs:40-63">
+
+`RepoRow` has a hand-written `FromRow` that decodes **positionally**. The
+existing columns occupy indices `0..=17`, so an appended column is `18`.
+
+```rust crates/store/src/repos.rs
+            updated_at: row.try_get(16)?,
+            synced_at: row.try_get(17)?,
+            open_issues: row.try_get(18)?,
+```
+
+The comment at `crates/store/src/repos.rs:17` explains why it is positional:
+name lookup at eighteen columns × 5 000 rows costs more than the query itself.
+
+</Step>
+
+<Step title="Map it in into_repo — crates/store/src/repos.rs:72-122">
+
+`into_repo` is where `RepoRow` becomes a `starlet_core::model::Repo`.
+Timestamps go through `parse_ts`; counts go straight across.
+
+```rust crates/store/src/repos.rs
+        Ok(Repo {
+            // …
+            updated_at: parse_ts(self.updated_at.as_deref()),
+            synced_at: parse_ts(self.synced_at.as_deref()),
+            open_issues: self.open_issues,
+            tags: Vec::new(),
+            groups: Vec::new(),
+        })
+```
+
+This step needs a `Repo` field to map *into* — see
+[Add a synced field](/guides/add-a-synced-field) for the domain-model half.
+
+</Step>
+
+<Step title="Extend the upsert in four places — crates/store/src/repos.rs:174">
+
+`upsert_repos` is one `INSERT … ON CONFLICT (id) DO UPDATE` per row inside a
+single transaction. Four separate edits, all positional:
+
+1. the INSERT column list (`crates/store/src/repos.rs:193-197`)
+2. the `VALUES (?,?,…)` placeholder count — same statement, `:197`
+3. the `ON CONFLICT … DO UPDATE SET` assignment
+   (`crates/store/src/repos.rs:198-217`)
+4. the `.bind(...)` chain, in exact positional order
+   (`crates/store/src/repos.rs:220-237`)
+
+```rust crates/store/src/repos.rs
+                INSERT INTO repos (
+                    id, node_id, full_name, name, owner, html_url, description, stargazers,
+                    last_commit_at, primary_language, languages_json, contributors_json,
+                    starred_at, archived, fork, topics_json, updated_at, synced_at,
+                    open_issues
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT (id) DO UPDATE SET
+                    -- …
+                    synced_at         = excluded.synced_at,
+                    open_issues       = excluded.open_issues
+```
+
+```rust crates/store/src/repos.rs
+            .bind(repo.synced_at.as_ref().map(format_ts).unwrap_or_else(|| now.clone()))
+            .bind(repo.open_issues)
+```
+
+**Decide the conflict rule explicitly.** Plain `= excluded.open_issues`
+overwrites unconditionally; `= coalesce(excluded.x, repos.x)` or a
+`CASE WHEN excluded.x = …` preserves what is already stored when the incoming
+record has no information. The three columns that already choose preservation,
+and why, are in [Traps](#traps).
+
+</Step>
+
+</Steps>
+
+## Indexed text is a table rebuild, not an ALTER TABLE
+
+If the new column should be *searchable*, `ALTER TABLE repos ADD COLUMN` is not
+enough and `ALTER TABLE repos_fts ADD COLUMN` is not available: FTS5 does not
+support adding a column to a content-owning virtual table. The migration has to
+drop and recreate `repos_fts`, recreate the triggers that feed it, and backfill
+from `repos`.
+
+Four things move together, and only the first is compile- or SQL-checked:
+
+| What | Where | Fails how if forgotten |
+| --- | --- | --- |
+| the virtual table declaration | `crates/store/migrations/0001_init.sql:92` — recreate it in the new file | SQL error from the new trigger |
+| `repos_fts_insert` / `repos_fts_update` / `repos_fts_delete` | `crates/store/migrations/0001_init.sql:100`, `:110`, `:105` | new column stays empty; no error |
+| `repo_tags_fts_insert` / `repo_tags_fts_delete` | `crates/store/migrations/0001_init.sql:118`, `:126` | tag text stops tracking; no error |
+| a `W_*` weight const **and** a `bm25()` argument | `crates/store/src/fts.rs:25-28` and `:42-43` | silently wrong ranking; no error |
+
+```sql crates/store/migrations/0003_fts_add_readme.sql
+DROP TRIGGER repos_fts_insert;
+DROP TRIGGER repos_fts_update;
+DROP TABLE repos_fts;
+
+CREATE VIRTUAL TABLE repos_fts USING fts5 (
+    full_name,
+    description,
+    topics,
+    tags,
+    readme
+);
+
+-- Recreate every trigger that writes the table, then backfill.
+-- rowid must always equal repos.id.
+INSERT INTO repos_fts (rowid, full_name, description, topics, tags, readme)
+SELECT id, full_name, coalesce(description, ''), topics_json, '', coalesce(readme_md, '')
+  FROM repos;
+```
+
+::::warning[The bm25 weight list is positional and silently wrong if the lengths diverge]
+`search_fts` interpolates the four weight constants into the SQL in column
+declaration order (`crates/store/src/fts.rs:42-43`). A five-column FTS table
+with four weights does not error — the missing weight defaults to 1.0 and the
+ranking quietly changes. Add the const at `crates/store/src/fts.rs:25-28`
+*and* the argument at `:42`.
+::::
+
+`full_name` is deliberately the lowest weight at 1.0 because the fuzzy matcher
+already owns that field and takes 70 % of the final score; `description` is
+5.0, `tags` 4.0, `topics` 3.0. Pick a new weight with that reasoning in hand —
+the derivation is in [Ranking](/reference/ranking).
+
+## Verify
+
+```sh
+just test-crate store   # 14 tokio tests against real SQLite and the real migrations
+just test-one migrations_apply_and_fts5_is_available
+just test-one a_refresh_preserves_lazily_fetched_columns
+```
+
+`crates/store/tests/store.rs` runs against `Store::open_in_memory()` with the
+real migration files, because the behaviour under test lives in SQL. The
+migration is therefore exercised by the whole crate suite, not by a dedicated
+test.
+
+Safety nets — these fail by construction:
+
+| Skipped step | What fails |
+| --- | --- |
+| `RepoRow` field without the matching `try_get` | compile error: missing field in initialiser |
+| a `.bind` count that disagrees with the placeholders | sqlx error on the first upsert |
+| invalid SQL in the migration | `migrations_apply_and_fts5_is_available` (`crates/store/src/lib.rs:136-166`) — and every other test in the crate, since they all open a store |
+| an FTS column with no matching weight | **nothing.** There is no test for weight-list length. |
+
+The one thing that is *not* a safety net is index alignment: `try_get(17)`
+where you meant `try_get(18)` decodes the wrong column, and only fails if the
+two types happen to disagree.
+
+## Traps
+
+**Positional decoding is the whole risk surface.** `REPO_COLUMNS`
+(`crates/store/src/repos.rs:65-67`), the `RepoRow` field order (`:19-38`), and
+the `try_get` indices (`:40-62`) are three parallel lists with no compiler link
+between them. The same holds between the INSERT column list (`:193-197`) and
+the `.bind` chain (`:220-237`). Nothing in Rust or SQLite will tell you they
+have drifted.
+
+**`sqlx::migrate!` embeds at compile time.** The migration directory is read by
+a proc macro, not at runtime. A new file the build has not recompiled against
+does not exist as far as the binary is concerned — and conversely, a migration
+is baked into the shipped binary and will run on user databases you cannot
+inspect. Write it to be correct on a database several versions old.
+
+**Three columns are deliberately preserved on upsert.** A star-listing refresh
+cannot know them, so overwriting from `excluded` would blank real data:
+
+| Column | Rule | Where |
+| --- | --- | --- |
+| `languages_json` | `CASE WHEN excluded.languages_json = '{}' THEN repos.languages_json ELSE excluded.languages_json END` — an empty map means "no information", not "no languages" | `crates/store/src/repos.rs:208-210` |
+| `contributors_json` | `coalesce(excluded.contributors_json, repos.contributors_json)`; the Rust side maps an empty `Vec` to SQL `NULL` first at `:185-189` | `crates/store/src/repos.rs:211` |
+| `starred_at` | `coalesce(excluded.starred_at, repos.starred_at)` | `crates/store/src/repos.rs:212` |
+
+**Three more columns are absent from the INSERT list entirely.** `etag`,
+`readme_md`, and `readme_fetched_at` never appear in `upsert_repos`
+(`crates/store/src/repos.rs:193-197`), so the upsert *cannot* touch them. That
+is the strongest form of preservation available, and the pattern to copy for a
+new lazily-fetched column. `a_refresh_preserves_lazily_fetched_columns`
+(`crates/store/tests/store.rs:263-325`) is the test holding that line.
+
+**`repos_fts.rowid == repos.id`, always.** Everything currently writes the FTS
+table through triggers. A new write path that inserts into `repos_fts` directly
+must honour that identity, or `search_fts` returns ids that do not exist.
+
+**A malformed MATCH is not an error.** `search_fts` swallows
+`sqlx::Error::Database` into an empty map (`crates/store/src/fts.rs:51-60`)
+because the user is mid-keystroke. If a new FTS column breaks the query, the
+symptom is "full-text search stopped contributing", not a failure.
+
+**JSON serialisation failures are swallowed too.** `upsert_repos` uses
+`unwrap_or_else(|_| "{}".into())` on the JSON columns
+(`crates/store/src/repos.rs:183-189`). If you add a JSON column whose type
+genuinely *can* fail to serialise — unlike `BTreeMap<String, i64>` — that idiom
+writes `{}` over real data. Handle the error instead of copying the pattern.
+
+**`prune_orphan_tags` is manual.** `ON DELETE CASCADE` removes `repo_tags` rows
+but leaves the `tags` row behind. If a new table needs cleanup, nothing calls
+it for you.

@@ -1,0 +1,143 @@
+---
+title: The runtime bridge
+description: A separate Tokio runtime bridged to GPUI by oneshot channels — the exact mechanism, the rule a developer must follow, and why a dropped receiver detaches instead of cancelling.
+sidebar:
+  label: Runtime bridge
+  icon: cpu
+---
+
+GPUI renders on the platform main loop. `sqlx` and `reqwest` are async-only and
+want a Tokio reactor. Starlet runs both: a dedicated two-worker Tokio runtime
+owned by the `Backend` global, bridged to GPUI by `oneshot` channels.
+
+The alternatives and why they lost are in [ADR 5](/adr/tokio-runtime-bridge).
+
+## The mechanism
+
+Three hops, always in this order:
+
+```mermaid
+sequenceDiagram
+    participant V as View method (main loop)
+    participant B as Backend (Tokio, 2 workers)
+    participant G as GPUI executor
+    V->>B: Backend::spawn(async { store.query().await })
+    B-->>V: oneshot::Receiver&lt;T&gt;
+    V->>G: cx.spawn(async move |this, cx| { … })
+    Note over B: work runs off the main loop
+    B->>G: tx.send(result)
+    G->>V: rx.await → this.update(cx, …) → cx.notify()
+```
+
+In code:
+
+```rust
+let rx = Backend::global(cx).spawn(async move { store.load_repos().await });
+
+cx.spawn(async move |this, cx| {
+    let Ok(result) = rx.await else { return };
+    let _ = this.update(cx, |this, cx| {
+        this.apply(result);
+        cx.notify();
+    });
+})
+```
+
+`Backend::spawn` (`crates/ui/src/services.rs:47`) wraps
+`runtime.spawn(async move { let _ = tx.send(future.await) })`.
+`Backend::spawn_blocking` (`:62`) is the same shape over
+`runtime.spawn_blocking`, for synchronous APIs — the OS keychain and
+`open::that_detached`.
+
+Timers stay on the GPUI side: `cx.background_executor().timer(d).await`.
+Multi-value streams use a `tokio::mpsc::unbounded_channel` whose sender goes to
+the Tokio task and whose receiver is drained inside `cx.spawn` — that is how
+both `SyncEvent` and `AiEvent` reach the UI.
+
+## The rule
+
+::::danger[Never block a frame]
+Never call `Store`, `GitHub`, `TokenStore`, `ProviderKeyStore`, or
+`open::that_detached` from a view method directly, and never `block_on` anywhere
+in `crates/ui`.
+
+`runtime.block_on` appears in exactly two lines of the whole workspace —
+`crates/app/src/main.rs:50` (open the database) and `:55` (read the persisted
+appearance) — and both run before a window exists.
+::::
+
+The measurable consequence: the fuzzy rank of 5 000 repositories takes 0.9 ms on
+the application thread, while the 3–4 ms FTS query and the 75 ms full-mirror
+load happen elsewhere. The window paints before either has run.
+
+## A dropped receiver detaches; it does not cancel
+
+This is deliberate. If a user closes the detail sheet immediately after
+promoting a tag, the write must still land — rolling it back because nobody is
+listening would be a data-loss bug.
+
+Real cancellation is therefore always explicit, an `Arc<AtomicBool>` the
+producer checks at a safe boundary:
+
+| Consumer | Flag | Checked at |
+| --- | --- | --- |
+| `SyncEngine` | `cancel_flag()` (`crates/sync/src/engine.rs:107`) | top of each star page, each refresh item, each language chunk |
+| `ai::analyze` | `cancel` parameter (`crates/ai/src/analysis.rs:57`) | before each batch request — never mid-flight, since an in-flight request is already paid for |
+
+## Task lifetimes
+
+Task handles live in `_`-prefixed fields on the view — `_sync_task`,
+`_schedule_task`, `_fts_task`, `_task` — so the work dies with the view.
+
+::::warning[Overwriting `_task` cancels the previous one]
+`crates/ui/src/analyze.rs:296` and `crates/ui/src/signin.rs:167` both assign to a
+single `_task` field, which drops and therefore cancels whatever was there. That
+is intentional for those two flows, but it is a trap if you add a third
+concurrent task to the same view — give it its own field.
+::::
+
+Fire-and-forget work calls `.detach()` instead.
+
+## Staleness: the revision counter
+
+An async answer can arrive after the question changed. Every query carries a
+revision counter (`SearchView::revision`), captured before the spawn and
+re-checked when the result lands:
+
+```rust
+let revision = self.revision;
+// … spawn …
+let Ok(hits) = rx.await else { return };
+this.update(cx, |this, cx| {
+    if this.revision != revision {
+        return; // a newer query has already been asked
+    }
+    // fold BM25 scores in and re-rank
+})
+```
+
+`crates/ui/src/search.rs:264-303`. Any new query-dependent async path **must**
+replicate this check, or a slow answer will overwrite a newer search.
+
+Re-ranking preserves the highlighted repository **by identity, not by row
+index**, so the selection does not slide down the list when stage two reorders.
+A *new* query resets the highlight to the top instead.
+
+## Testing across two executors
+
+GPUI's test executor knows nothing about the Tokio runtime, so
+`run_until_parked()` alone is not enough — it parks while a Tokio worker is still
+mid-query. The pattern is a loop of `run_until_parked` plus a short real sleep:
+
+```rust
+fn settle(cx: &mut TestAppContext) {
+    for _ in 0..40 {
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+```
+
+`crates/ui/tests/workspace.rs:111-117`. For anything with a real deadline, use
+the `wait_for(cx, "…", pred)` helper at `:120` instead of a fixed number of
+iterations. Full recipe in [Testing](/development/testing#headless-gpui-tests).

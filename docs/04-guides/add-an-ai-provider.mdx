@@ -1,0 +1,325 @@
+---
+title: Add an AI provider
+description: Add a fourth backend behind the AiProvider trait — the module, the factory arm, the price table, the settings policy, and the wiremock tests.
+sidebar:
+  label: Add an AI provider
+  icon: sparkles
+---
+
+A provider is one file in `crates/ai` implementing a five-method trait, plus
+four one-line registrations and a price table. Nothing in the run loop, the
+prompts, the parser, or the retry policy changes: the three existing backends
+differ *only* in transport, and that is the seam.
+
+The worked example is Mistral — hosted, keyed, and OpenAI-shaped, so
+`openai.rs` is the template. The design rules behind the trait are in
+[ADR 0009](/adr/byok-ai); the user-facing setup is
+[AI providers](/getting-started/ai-providers).
+
+<Steps>
+
+<Step title="Create crates/ai/src/mistral.rs, modelled on openai.rs">
+
+Three public consts, a struct, two constructors, one private `chat`, and the
+trait impl. Line references below are the corresponding items in
+`crates/ai/src/openai.rs`.
+
+```rust crates/ai/src/mistral.rs
+pub const ID: &str = "mistral";                                  // openai.rs:13
+pub const DEFAULT_MODEL: &str = "mistral-small-latest";          // openai.rs:14
+pub const DEFAULT_BASE_URL: &str = "https://api.mistral.ai";     // openai.rs:15
+
+pub struct Mistral {                                             // openai.rs:22
+    key: ApiKey,
+    model: String,
+    base_url: String,
+    http: reqwest::Client,
+}
+
+impl Mistral {
+    pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self { … }  // openai.rs:34
+    pub fn with_base_url(mut self, url: &str) -> Self { … }                          // openai.rs:48
+}
+```
+
+`new` must fall back to `DEFAULT_MODEL` on an empty or whitespace-only model
+string. `with_base_url` must trim a trailing `/` — it is the wiremock and
+reverse-proxy seam, and without it every test URL doubles a slash.
+
+The private `chat` is the only part that is provider-specific:
+
+```rust crates/ai/src/mistral.rs
+async fn chat(&self, system: &str, user: &str, retry: bool) -> Result<String> {
+    let key = self.key.require()?;                    // client.rs:31 — before the request
+    let body = json!({
+        "model": self.model,
+        "temperature": 0,
+        "response_format": { "type": "json_object" },
+        "messages": [
+            { "role": "system",  "content": system },
+            { "role": "user",    "content": prompt::with_retry(user, retry) },  // prompt.rs:70
+        ],
+    });
+    let response = self
+        .http
+        .post(format!("{}/v1/chat/completions", self.base_url))
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await?;
+    let raw = body_or_status(response, &self.key).await?;                  // client.rs:57
+    let envelope: serde_json::Value = serde_json::from_str(&raw)?;
+    envelope_field(&envelope, "/choices/0/message/content", ID)            // client.rs:121
+}
+```
+
+`body_or_status`, `envelope_field`, `parse_with_one_retry`, and `ApiKey` all
+come from the private `client` module — copy the import line from
+`crates/ai/src/openai.rs:7`.
+
+If the response shape is not addressable by a JSON pointer, write a bespoke
+extractor instead — `Anthropic::text_blocks`
+(`crates/ai/src/anthropic.rs:91`) concatenates every `content[]` element whose
+`type` is `"text"` and skips `thinking` blocks.
+
+Then the trait impl. All five methods, and `tag`/`group` delegate:
+
+```rust crates/ai/src/mistral.rs
+#[async_trait]
+impl AiProvider for Mistral {                        // provider.rs:88
+    fn id(&self) -> &'static str { ID }              // provider.rs:93
+    fn model(&self) -> &str { &self.model }          // provider.rs:96
+
+    fn estimate(&self, repos: usize) -> CostEstimate {           // provider.rs:99
+        cost::estimate(repos, cost::mistral_price(&self.model))
+    }
+
+    async fn tag(&self, batch: &[RepoSummary]) -> Result<Vec<RepoTags>> {   // provider.rs:102
+        let user = prompt::tag_user(batch)?;
+        parse_with_one_retry(                                              // client.rs:90
+            ID,
+            |retry| self.chat(prompt::TAG_SYSTEM, &user, retry),
+            parse::parse_tags,
+        )
+        .await
+    }
+
+    async fn group(&self, repos: &[RepoWithTags]) -> Result<Vec<Group>> {   // provider.rs:106
+        // same shape with GROUP_SYSTEM / group_user / parse_groups
+    }
+}
+```
+
+`parse_with_one_retry` owns the entire retry policy: one resend, only on a
+*parse* failure, never on transport or HTTP status. Do not add your own.
+
+</Step>
+
+<Step title="Declare and re-export it — crates/ai/src/lib.rs:25-42">
+
+```rust crates/ai/src/lib.rs
+pub mod anthropic;
+pub mod cost;
+pub mod mistral;
+pub mod ollama;
+pub mod openai;
+
+pub use mistral::Mistral;
+```
+
+The module list is alphabetical; `client` stays private
+(`crates/ai/src/lib.rs:34`).
+
+</Step>
+
+<Step title="Add the provider_for arm — crates/ai/src/lib.rs:53-58">
+
+```rust crates/ai/src/lib.rs
+    match id {
+        openai::ID => Some(Box::new(OpenAi::new(api_key, model))),
+        anthropic::ID => Some(Box::new(Anthropic::new(api_key, model))),
+        mistral::ID => Some(Box::new(Mistral::new(api_key, model))),
+        ollama::ID => Some(Box::new(Ollama::new(api_key, model))),
+        _ => None,
+    }
+```
+
+Match on the `ID` const, never on a string literal. The whole point of the
+const is that the settings key, the keychain account suffix, and this arm are
+the same bytes.
+
+</Step>
+
+<Step title="Extend PROVIDER_IDS to [&str; 4] — crates/ai/src/lib.rs:62">
+
+```rust crates/ai/src/lib.rs
+/// Every provider id, in the order the settings UI should list them.
+pub const PROVIDER_IDS: [&str; 4] = [openai::ID, anthropic::ID, mistral::ID, ollama::ID];
+```
+
+The array length is hard-coded, so the bump is a compile error. The order is
+the settings dropdown order (`crates/ui/src/settings.rs:83-86` reads it
+directly), so put it where a user should see it.
+
+</Step>
+
+<Step title="Add a price table — crates/ai/src/cost.rs:61-103">
+
+If the provider costs money, add a `MISTRAL_PRICES` table beside
+`OPENAI_PRICES` (`crates/ai/src/cost.rs:61`) and `ANTHROPIC_PRICES` (`:76`),
+each with a fallback like `OPENAI_FALLBACK` (`:73`), then a
+`pub(crate) fn mistral_price` beside `openai_price` (`:97`) and
+`anthropic_price` (`:101`).
+
+```rust crates/ai/src/cost.rs
+const MISTRAL_PRICES: &[(&str, Price)] = &[
+    // Most specific prefix FIRST. `lookup` returns the first hit.
+    ("mistral-small-latest", price(0.20, 0.60)),
+    ("mistral-small", price(0.20, 0.60)),
+    ("mistral-large", price(2.00, 6.00)),
+];
+const MISTRAL_FALLBACK: Price = price(2.00, 6.00);
+
+pub(crate) fn mistral_price(model: &str) -> Price {
+    lookup(model, MISTRAL_PRICES, MISTRAL_FALLBACK)
+}
+```
+
+If it is free — a local runtime — use `Price::FREE`
+(`crates/ai/src/cost.rs:35`) exactly as Ollama does
+(`crates/ai/src/ollama.rs:92`). Token counts stay real so the UI can still show
+the job size; only the dollar figure is zero.
+
+</Step>
+
+<Step title="Add the default_model arm and decide the settings policy — crates/ui/src/analyze.rs:305-338">
+
+```rust crates/ui/src/analyze.rs
+fn default_model(id: &str) -> &'static str {
+    match id {
+        starlet_ai::anthropic::ID => starlet_ai::anthropic::DEFAULT_MODEL,
+        starlet_ai::mistral::ID => starlet_ai::mistral::DEFAULT_MODEL,
+        starlet_ai::ollama::ID => starlet_ai::ollama::DEFAULT_MODEL,
+        _ => starlet_ai::openai::DEFAULT_MODEL,
+    }
+}
+```
+
+Then two explicit policy decisions in `build_provider`
+(`crates/ui/src/analyze.rs:305`):
+
+| Decision | Line | For a hosted, keyed provider |
+| --- | --- | --- |
+| may it run without a key? | `crates/ui/src/analyze.rs:311-314` | no — leave `local` false so the empty-key guard rejects it |
+| may the user set the endpoint? | `crates/ui/src/analyze.rs:324-328` | no — hosted providers keep their published origin |
+
+Both defaults are already correct for a hosted provider: `local` is
+`id == ollama::ID`, so a new hosted id needs *no* change here beyond the
+`default_model` arm. That is deliberate — see [Traps](#traps).
+
+</Step>
+
+<Step title="Add wire tests — crates/ai/tests/providers.rs">
+
+Mirror the OpenAI block. Five cases for a keyed provider, using the
+`with_base_url` seam against wiremock:
+
+| Case | The OpenAI equivalent |
+| --- | --- |
+| documented request: path, auth header, model, `temperature: 0`, JSON mode, system+user roles | `crates/ai/tests/providers.rs:96` |
+| exactly one retry, and the retry body contains "could not be parsed" | `crates/ai/tests/providers.rs:129` |
+| give up after the second bad reply — exactly 2 requests | `crates/ai/tests/providers.rs:150` |
+| a 401 becomes `AiError::Status` with the key redacted, and is **not** retried | `crates/ai/tests/providers.rs:168` |
+| a missing key never reaches the network | `crates/ai/tests/providers.rs:192` |
+
+Reuse the existing helpers rather than writing new ones: `GOOD` returns
+`"Rust"` at confidence 1.4 so sanitisation is provable, `Sequence` scripts
+per-call bodies without depending on mock ordering, and `assert_good` checks
+names, the clamp to 1.0, and `TagSource::Ai` on every tag.
+
+</Step>
+
+</Steps>
+
+## Verify
+
+```sh
+just test-crate ai
+just test-one every_listed_id_builds_a_provider_that_agrees_about_its_own_id
+just test-crate ui    # settings dropdown reads PROVIDER_IDS
+```
+
+Safety nets:
+
+| Skipped step | What fails | Where |
+| --- | --- | --- |
+| bump `PROVIDER_IDS` to `4` | compile error: wrong array length | `crates/ai/src/lib.rs:62` |
+| a trait method | compile error: unimplemented trait item | `crates/ai/src/provider.rs:88-107` |
+| `provider_for` arm, after extending `PROVIDER_IDS` | `every_listed_id_builds_a_provider_that_agrees_about_its_own_id` | `crates/ai/src/lib.rs:69` |
+| `id()` returning something other than the registered id | same test | `crates/ai/src/lib.rs:72` |
+| an empty `DEFAULT_MODEL` | same test — it asserts the model is non-empty | `crates/ai/src/lib.rs:73-76` |
+| the price table | nothing fails, but `estimate` silently uses whatever you wired instead | — |
+
+The unit test at `crates/ai/src/lib.rs:69` iterates `PROVIDER_IDS`, so once step
+4 lands, the new id is covered automatically: it must build, and it must agree
+about its own id and have a non-empty default model. That is the cheapest step
+in the guide and the one that catches the most.
+
+## Traps
+
+::::danger[id() is frozen the moment it ships]
+`AiProvider::id` (`crates/ai/src/provider.rs:93`) is simultaneously the
+settings value persisted under `KEY_AI_PROVIDER`, the keychain account suffix
+the user's API key is stored under, and the `provider_for` match arm
+(`crates/ai/src/lib.rs:53-58`). Rename it in a later release and every existing
+user's stored key becomes unreachable while their settings silently fall back
+to a different provider. Pick the string once.
+::::
+
+**The price table is a first-hit-wins prefix match, so order matters.**
+`lookup` (`crates/ai/src/cost.rs:105`) lowercases and takes the *first*
+matching prefix. `gpt-4o-mini` must precede `gpt-4o` in `OPENAI_PRICES` or
+every mini model is billed at the flagship rate. Put the most specific entries
+first and add a test alongside the existing "longest/most-specific prefix wins"
+case in `crates/ai/src/cost.rs:156`.
+
+**Only Ollama gets a user-settable endpoint, and that is a security boundary.**
+The comment at `crates/ui/src/analyze.rs:322-323` states the reason: hosted
+providers keep their published origins so a typo — or a malicious paste — in
+the endpoint field cannot exfiltrate the user's API key to an attacker's host.
+Adding a keyed provider to the endpoint-override branch at
+`crates/ui/src/analyze.rs:324-328` turns a settings field into a key-leak
+vector. Do not.
+
+**Call `key.require()?` before building the request.** `ApiKey::require`
+(`crates/ai/src/client.rs:31`) returns `AiError::MissingKey` on an empty or
+whitespace-only key. Do it as the first line of `chat`, not after
+constructing the body — a missing key must never touch the network, and
+`crates/ai/tests/providers.rs:192` asserts exactly that. Ollama is the sole
+exception and it is deliberate: a keyless local run is the normal case there.
+
+**Never retry an HTTP-status error.** `parse_with_one_retry`
+(`crates/ai/src/client.rs:90`) resends once, only when `parse` fails. Transport
+and status errors propagate with `?` and are never retried — a 401 retried is
+two failed auth attempts, and a 429 retried is a worse rate-limit position. If
+your `chat` grows its own loop, delete it.
+
+**Redaction is not optional and not automatic in your code.** `body_or_status`
+(`crates/ai/src/client.rs:57`) truncates an error body to 512 chars and
+replaces the literal key with `[redacted]`, because gateways echo the
+`Authorization` header back in 401 bodies. Route *every* non-success response
+through it. Never build an `AiError::Status` by hand, never log a request body,
+and never put a key in a URL.
+
+**A truncated reply is a parse failure that burns the retry.** Anthropic's
+`MAX_TOKENS = 8192` exists for this reason. If the provider requires or accepts
+a token cap, set it high enough that a 25-repo tagging reply cannot be cut off,
+or the run spends its single retry on a request that will be truncated again.
+
+**JSON mode is per-provider and lives only in `chat`.** OpenAI uses
+`response_format: {type: "json_object"}`, Ollama uses a top-level
+`format: "json"`, Anthropic has none at all and relies on the prompt, the
+tolerant parser, and the retry. All three send byte-identical instructions from
+`crates/ai/src/prompt.rs`. Do not add a provider-specific prompt to compensate
+for a missing JSON mode — the parser already recovers fenced blocks, prose
+prefixes and suffixes, and braces inside string literals.

@@ -1,0 +1,89 @@
+---
+title: Decisions
+description: One architecture decision record per decision that would otherwise need archaeology — what was decided, what was rejected, and what it cost.
+sidebar:
+  label: Overview
+  icon: scale
+---
+
+Eleven ADRs, one per decision that would otherwise need archaeology. Each records
+the context, the options considered, the decision, and — the part that matters
+later — its consequences, including the ones that are inconvenient.
+
+All eleven are <Badge variant="success">Accepted</Badge>. None has been
+superseded.
+
+| | Decision | Touches |
+| --- | --- | --- |
+| [1](/adr/published-gpui-crates) | Published GPUI crates, not a Git revision | `ui`, `Cargo.toml`, CI |
+| [2](/adr/reqwest-github-client) | A direct `reqwest` GitHub client instead of `octocrab` | `sync` |
+| [3](/adr/two-stage-search) | Two-stage search: synchronous fuzzy, asynchronous BM25 | `core`, `store`, `ui` |
+| [4](/adr/nucleo-matcher-not-injector) | `nucleo`'s low-level matcher, not its threaded injector | `core` |
+| [5](/adr/tokio-runtime-bridge) | A separate Tokio runtime bridged to GPUI | `ui`, `app` |
+| [6](/adr/sqlite-schema) | WAL, an owned FTS5 table, three separate tag sources | `store` |
+| [7](/adr/github-app-device-flow) | GitHub App device flow, token in the OS keychain | `sync`, `ui` |
+| [8](/adr/incremental-sync) | Watermark, count check, lazy contributors | `sync` |
+| [9](/adr/byok-ai) | One provider trait, strict JSON, one retry | `ai`, `ui` |
+| [10](/adr/theme-as-tokens) | The palette is a theme file; assets are embedded | `ui` |
+| [11](/adr/platform-keybindings) | Diverge the palette shortcut by platform | `ui` |
+
+## Grouped by what they constrain
+
+**The rendering and runtime boundary** — [1](/adr/published-gpui-crates),
+[5](/adr/tokio-runtime-bridge), [10](/adr/theme-as-tokens),
+[11](/adr/platform-keybindings). Together these are why `ui` is the only crate
+that knows a window exists, why `runtime.block_on` appears in exactly two lines
+of the workspace, and why no view contains a colour literal.
+
+**The search path** — [3](/adr/two-stage-search),
+[4](/adr/nucleo-matcher-not-injector), [6](/adr/sqlite-schema). Why a keystroke
+paints a frame from a synchronous fuzzy pass and re-ranks when BM25 lands, and why
+the FTS5 table owns its content rather than pointing at `repos`.
+
+**The network** — [2](/adr/reqwest-github-client),
+[7](/adr/github-app-device-flow), [8](/adr/incremental-sync). Six REST endpoints,
+two GraphQL documents, no client secret, and a watermark plus a count check
+instead of paging the whole star list every fifteen minutes.
+
+**The optional model** — [9](/adr/byok-ai). Why the AI path ships no key, runs
+nothing on launch, batches at 25, and can be stopped without losing work.
+
+## Writing a new one
+
+Copy the shape, not a template file. Four headings, in this order:
+
+<Steps>
+  <Step title="Context">
+    The constraint that forces a decision, and the two or three options that
+    were genuinely on the table. If there was only one option, there is no
+    decision to record.
+  </Step>
+  <Step title="Decision">
+    Which option, stated in one or two sentences. Present tense.
+  </Step>
+  <Step title="Consequences">
+    Including the bad ones. An ADR whose consequences are all upside is a
+    marketing document. Name the test or the code comment that enforces each
+    consequence, so the record and the code cannot drift apart silently.
+  </Step>
+  <Step title="File it">
+    `docs/adr/00NN-kebab-title.mdx`, next number in sequence, with frontmatter
+    carrying `title` (`"N. Full title"`), a one-sentence `description`, and a
+    short `sidebar.label`. Put
+    `<Badge variant="success">Accepted</Badge>` where the status line goes, and
+    add a row to the table above.
+  </Step>
+</Steps>
+
+The numeric prefix orders the sidebar and is stripped from the URL, so
+`0012-something.mdx` is served at `/adr/something`.
+
+::::note[One known drift, deliberately left in place]
+[ADR 11](/adr/platform-keybindings) describes the toolbar label as coming from a
+single `command_palette_shortcut()` function. No such function exists; the real
+mechanism is `Kbd::binding_for_action`, called at
+`crates/ui/src/search.rs:849` and `crates/ui/src/palette.rs:193`. The ADR records
+the *decision*, which still holds, and an ADR is a historical record rather than
+a living document — so the correction lives in
+[Keybindings](/reference/keybindings) instead of being edited into the ADR.
+::::

@@ -1,0 +1,229 @@
+---
+title: Add a synced field
+description: Carry a new GitHub field from the star listing JSON through the wire struct, the domain model, the store, and the sync tests without blanking it on refresh.
+sidebar:
+  label: Add a synced field
+  icon: refresh-cw
+---
+
+Six links in one chain: GitHub's JSON → the wire struct → `starlet_core::Repo`
+→ a migration → the store's row and upsert → a test fixture that proves the
+whole thing. Break any link and the field is silently absent rather than wrong,
+which is why the last step is not optional.
+
+The worked example is `open_issues_count` from `GET /user/starred`. The store
+half is [Add a migration](/guides/add-a-migration) — this guide does not repeat
+it. The two sync algorithms it has to survive are described in
+[Sync pipeline](/architecture/sync-pipeline).
+
+<Steps>
+
+<Step title="Add it to the wire struct — crates/sync/src/wire.rs:20-40">
+
+`RepoPayload` mirrors GitHub's repository JSON. It exists only at the network
+boundary: nothing above `sync` sees a `stargazers_count`.
+
+```rust crates/sync/src/wire.rs
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoPayload {
+    // …
+    #[serde(default)]
+    pub topics: Vec<String>,
+    pub updated_at: Option<String>,
+    #[serde(default)]
+    pub open_issues_count: i64,
+}
+```
+
+Use `#[serde(default)]` or `Option<_>`. Never a bare required field: sparse
+payloads are normal, and `absent_optional_fields_do_not_fail_the_row`
+(`crates/sync/src/wire.rs`) exists to keep it that way.
+
+</Step>
+
+<Step title="Add it to the domain model — crates/core/src/model.rs:17-43">
+
+`Repo` derives `Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize`.
+All six still have to hold.
+
+```rust crates/core/src/model.rs
+pub struct Repo {
+    // …
+    pub updated_at: Option<DateTime<Utc>>,
+    pub synced_at: Option<DateTime<Utc>>,
+    /// Open issues as of the last refresh. 0 also means "never refreshed".
+    pub open_issues: i64,
+    // …
+}
+```
+
+If the AI should see the field, add it to `RepoSummary`
+(`crates/core/src/model.rs:144-151`) with the right `skip_serializing_if` and
+extend `impl From<&Repo> for RepoSummary` (`crates/core/src/model.rs:154`).
+`RepoSummary` is deliberately tiny — every field costs tokens on every batch —
+so only add it if the model can actually use it.
+
+</Step>
+
+<Step title="Map it in the conversion — crates/sync/src/wire.rs:77-101">
+
+`RepoPayload::into_repo` is the single conversion into the domain model. There
+is no other one.
+
+```rust crates/sync/src/wire.rs
+    pub fn into_repo(self, starred_at: Option<&str>, synced_at: DateTime<Utc>) -> Repo {
+        Repo {
+            // …
+            updated_at: parse_ts(self.updated_at.as_deref()),
+            synced_at: Some(synced_at),
+            open_issues: self.open_issues_count,
+            tags: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+```
+
+Timestamps go through `parse_ts` (`crates/sync/src/wire.rs:65`), which maps
+anything unparseable to `None` rather than erroring.
+
+</Step>
+
+<Step title="Add the migration — crates/store/migrations/">
+
+```sql crates/store/migrations/0002_add_open_issues.sql
+ALTER TABLE repos ADD COLUMN open_issues INTEGER NOT NULL DEFAULT 0;
+```
+
+Applied by `sqlx::migrate!("./migrations")`
+(`crates/store/src/lib.rs:111`). Full rules, including why editing
+`0001_init.sql` bricks existing installs, are in
+[Add a migration](/guides/add-a-migration).
+
+</Step>
+
+<Step title="Add the store row, column list, and upsert — crates/store/src/repos.rs">
+
+Five positional edits, all detailed in
+[Add a migration](/guides/add-a-migration):
+
+| Edit | Location |
+| --- | --- |
+| append to `REPO_COLUMNS` | `crates/store/src/repos.rs:65-67` |
+| add the `RepoRow` field | `crates/store/src/repos.rs:19-38` |
+| add `row.try_get(18)?` at the same position | `crates/store/src/repos.rs:40-63` |
+| map it in `into_repo` | `crates/store/src/repos.rs:72-122` |
+| INSERT list, placeholders, `ON CONFLICT`, `.bind` | `crates/store/src/repos.rs:193-197`, `:198-217`, `:220-237` |
+
+The decision that matters here is the `ON CONFLICT` rule. A field that arrives
+on *every* star-listing page can be overwritten unconditionally. A field that
+only some responses carry needs `coalesce`, or a refresh will blank it.
+
+</Step>
+
+<Step title="Extend the sync fixture and assert on it — crates/sync/tests/sync.rs:15">
+
+`starred()` builds the star-listing JSON the wiremock tests serve. Until the
+field is in the fixture, every sync test passes without ever having carried it.
+
+```rust crates/sync/tests/sync.rs
+fn starred(id: i64, full_name: &str, starred_at: &str) -> serde_json::Value {
+    json!({
+        "starred_at": starred_at,
+        "repo": {
+            // …
+            "topics": ["cli"],
+            "open_issues_count": 42,
+        }
+    })
+}
+```
+
+Then assert on it in `full_sync_pages_through_the_star_list` — and, if the
+field is also served by `GET /repos/{full_name}`, in
+`a_modified_refresh_updates_metadata_and_keeps_the_star_date`, which is the
+test that already guards the refresh path against blanking.
+
+</Step>
+
+</Steps>
+
+## Verify
+
+```sh
+just test-crate sync    # wiremock tests against the with_base_url seam
+just test-crate store
+just test-crate core
+just test-one full_sync_pages_through_the_star_list
+just test-one a_modified_refresh_updates_metadata_and_keeps_the_star_date
+```
+
+Safety nets, in order of how much they will save you:
+
+| Skipped step | What fails |
+| --- | --- |
+| `Repo` field without a `wire.rs` mapping | compile error: missing field in initialiser |
+| `Repo` field without a store mapping | compile error in `RepoRow::into_repo` |
+| `RepoRow` field without a `try_get` | compile error |
+| the fixture (step 6) | **nothing.** Every test still passes, carrying a default value end to end. |
+| the refresh carry-over | `a_modified_refresh_updates_metadata_and_keeps_the_star_date` only if you assert on the new field |
+
+Steps 1–5 are largely held up by the compiler because `Repo` has no `..`
+fallthrough on any of its three construction sites. Step 6 is not, which is why
+it is a step rather than a suggestion.
+
+## Traps
+
+::::danger[A field the star listing does not carry is blanked on every refresh]
+The 24-hour metadata refresh calls `into_repo(None, Utc::now())`
+(`crates/sync/src/engine.rs:340`) with the payload from
+`GET /repos/{full_name}`. `into_repo` fills the **whole** `Repo`, so anything
+that endpoint omits becomes the field's default — and the upsert then writes
+that default over real data.
+
+The existing fix is explicit carry-over from the loaded row, two lines up and
+one line down:
+
+```rust crates/sync/src/engine.rs
+let existing_star = self.store.load_repo(*id).await?.and_then(|r| r.starred_at);
+let mut repo = value.into_repo(None, Utc::now());
+repo.starred_at = existing_star;
+```
+
+If your field is only on the star listing, it needs exactly this treatment
+(`crates/sync/src/engine.rs:339-341`) — or a `coalesce` in the upsert's
+`ON CONFLICT` clause, which is the same idea moved into SQL. Choose one and
+say which in a comment.
+::::
+
+**A missing field must never fail a row.** `#[serde(default)]` or `Option<_>`,
+always. GitHub's responses vary by endpoint, by media type, and over time; a
+required field turns one unusual repository into a failed page, and a failed
+page into a stalled sync. The existing struct uses `#[serde(default)]` on
+`stargazers_count`, `archived`, `fork`, and `topics`
+(`crates/sync/src/wire.rs:28-38`) for exactly this reason.
+
+**`Repo` derives `Default`, so the field needs a meaningful zero.** For a count
+that is `0`; for a timestamp `None`. Ask what the zero *means* — for
+`languages` an empty map means "not backfilled yet", not "no languages", and
+the store's upsert has a `CASE WHEN` to encode that distinction
+(`crates/store/src/repos.rs:208-210`). If your field has the same ambiguity,
+make it `Option<T>` instead of leaning on a sentinel.
+
+**`Repo` derives `Eq`, so no bare `f32`.** `Repo` is compared in tests and
+diffed by the UI. The only escape hatch in the codebase is the hand-written
+`impl Eq for RepoTag` (`crates/core/src/model.rs:120`), which is legal only
+because nothing ever puts a `NaN` in `confidence` — a `NaN` there would break
+reflexivity and poison anything relying on `Eq`. Prefer an integer or a
+`Option<OrderedFloat>`-shaped wrapper over repeating that trick.
+
+**Nothing above `sync` may see the wire name.** `open_issues_count` is
+GitHub's name; `open_issues` is Starlet's. The rename happens in `into_repo`
+and nowhere else (`crates/sync/src/wire.rs:77-101`). Leaking `_count` into
+`Repo` would put GitHub's JSON vocabulary into the domain layer, which is the
+thing [the layering rule](/architecture) exists to prevent.
+
+**A GraphQL-only field is a different job.** The star listing and the repo
+endpoint are REST. Fields that only GraphQL exposes go through a batched query
+governed by `GRAPHQL_BATCH = 25` and a per-run budget, like the language
+backfill — a new sync phase, not a new column on `RepoPayload`. See
+[sync](/crates/sync).

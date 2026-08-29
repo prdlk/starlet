@@ -1,0 +1,197 @@
+---
+title: Keybindings
+description: Every chord Starlet binds, the two key contexts that scope them, and why the command palette is the one shortcut that differs by platform.
+sidebar:
+  label: Keybindings
+  icon: keyboard
+---
+
+Throughout this page **`Cmd` means `Ctrl` on Linux and Windows**. GPUI spells
+that `secondary-`, and every binding below except one uses it, so the modifier
+is whichever one your platform expects. The command palette is the single
+deliberate exception, for a reason worth reading.
+
+All bindings are registered once at startup by `bind_keys`
+(`crates/ui/src/actions.rs:45-98`), after `gpui_component::init`.
+
+## Keys
+
+| Key | Action | Where |
+| --- | --- | --- |
+| Type anything | Filters and re-ranks on every keystroke | The search input has focus at launch |
+| `↑` `↓` | Move the highlight | Works while typing — you never have to leave the query to steer results |
+| `Ctrl+K` `Ctrl+J` | Move the highlight | Workspace only |
+| `Cmd+↑` `Cmd+↓` | Jump to the first / last result | Anywhere |
+| `Enter` | Open the highlighted repository in the browser | Anywhere |
+| `Space` | Open the detail sheet | **Results table only** — in the input it types a space |
+| `Cmd+C` | Copy the highlighted repository's URL | Anywhere, including while typing |
+| `Cmd+K` (macOS) / `Ctrl+Shift+P` (elsewhere) | Command palette | Anywhere |
+| `Cmd+B` | Toggle the filter sidebar | Anywhere |
+| `Cmd+,` | Settings | Anywhere |
+| `Cmd+R` | Sync now | Anywhere |
+| `Cmd+F` | Focus the search input and select its contents | Anywhere |
+| `Esc` | Dismiss — see the cascade below | Anywhere |
+| `Tab` | Move focus between the search input and the results table | Anywhere |
+
+Bindings: `crates/ui/src/actions.rs:53-96`. Handlers:
+`crates/ui/src/search.rs:397` (select), `:410` (first/last), `:422` (open),
+`:442` (copy), `:449` (detail), `:672` (cycle focus), `:687` (focus search),
+`:691` (dismiss), `:716` (sidebar), `:723` (palette), `:732` (settings),
+`:736` (sync).
+
+## Key contexts
+
+There are two Starlet contexts, plus the ones `gpui-component` owns (`Input`,
+`Table`, `Dialog`, `Sheet`) (`crates/ui/src/actions.rs:1-6`):
+
+| Constant | Value | Scope |
+| --- | --- | --- |
+| `CONTEXT` | `"Starlet"` | the workspace root — global commands bind here (`crates/ui/src/actions.rs:11`) |
+| `RESULTS_CONTEXT` | `"StarletResults"` | the results table (`crates/ui/src/actions.rs:14`) |
+
+Almost everything is bound on `Starlet`. Only four bindings are scoped
+narrower:
+
+| Chord | Context | Cite |
+| --- | --- | --- |
+| `space` → `ShowDetail` | `StarletResults` **only** | `crates/ui/src/actions.rs:77` |
+| `enter` → `OpenInBrowser` | also on `StarletResults` | `crates/ui/src/actions.rs:78` |
+| `tab` → `CycleFocus` | also on `StarletResults` | `crates/ui/src/actions.rs:94` |
+| `up`/`down` → `SelectPrev`/`SelectNext` | also on `StarletResults` | `crates/ui/src/actions.rs:95-96` |
+
+Two consequences follow from that scoping, and both are load-bearing.
+
+**`Space` is not a global shortcut.** It is `ShowDetail` only inside
+`RESULTS_CONTEXT`; while the query has focus it is a literal space character,
+which it has to be (`crates/ui/src/actions.rs:75-77`). So `Tab` — `CycleFocus`,
+`crates/ui/src/search.rs:672` — is the **only** keyboard route from the search
+input to the detail sheet: `Tab` to hand the keyboard to the table, then
+`Space`.
+
+**`Enter` from the input is not an action.** While the input has focus, Enter
+arrives as `InputEvent::PressEnter` rather than as an `OpenInBrowser` dispatch
+(`crates/ui/src/search.rs:255-259`). The `enter` binding on `Starlet`
+(`crates/ui/src/actions.rs:74`) is what catches it everywhere else. If you add
+an Enter behaviour, you have to handle both paths.
+
+## Actions without a chord
+
+Two of the sixteen actions (`crates/ui/src/actions.rs:16-41`) are declared and
+handled but never bound to a key:
+
+| Action | Reachable from | Handler |
+| --- | --- | --- |
+| `Analyze` | command palette | `crates/ui/src/search.rs:744` |
+| `SignOut` | toolbar and command palette | `crates/ui/src/search.rs:748` |
+
+Both are typed actions all the same, so they dispatch through exactly the same
+path as a keyboard command — the palette re-dispatches the real action rather
+than duplicating the handler (`crates/ui/src/palette.rs:265`).
+
+## Why the palette diverges
+
+```rust crates/ui/src/actions.rs:53-56
+#[cfg(target_os = "macos")]
+KeyBinding::new("cmd-k", ToggleCommandPalette, Some(CONTEXT)),
+#[cfg(not(target_os = "macos"))]
+KeyBinding::new("ctrl-shift-p", ToggleCommandPalette, Some(CONTEXT)),
+```
+
+GPUI's `secondary-` resolves to Cmd on macOS and **Ctrl** everywhere else. Had
+the palette been bound to `secondary-k`, on Linux and Windows that would compile
+to `ctrl-k` — which is already bound to `SelectPrev`
+(`crates/ui/src/actions.rs:70`). Two bindings for one chord in one context is
+not an error; registration order silently decides the winner, so the collision
+would show up as "selection movement stopped working" rather than as anything
+diagnosable.
+
+The divergence is therefore a `#[cfg]` pair on adjacent `KeyBinding::new`
+entries inside the same `cx.bind_keys([...])` array. Non-macOS platforms get
+`Ctrl+Shift+P`, which is what people already reach for.
+
+See [ADR 11 — platform keybindings](/adr/platform-keybindings).
+
+## Labels are read out of the keymap
+
+No chord is ever typed into a label. Both surfaces that display one read it back
+out of the live keymap through `Kbd::binding_for_action`:
+
+| Surface | Call | Cite |
+| --- | --- | --- |
+| Toolbar palette button | `Kbd::binding_for_action(&ToggleCommandPalette, Some(actions::CONTEXT), window)`, wrapped in `when_some` | `crates/ui/src/search.rs:849-852` |
+| Palette row | `Kbd::binding_for_action(action.as_ref(), Some(actions::CONTEXT), window)`, fed by `Command::bound_action()` | `crates/ui/src/palette.rs:193` |
+
+Two properties fall out of that. A row can never advertise a chord this
+platform does not bind — the platform divergence above needs no second
+`#[cfg]` in the view layer. And an action with no binding renders **no button
+at all**, because `when_some` on a `None` simply omits the element.
+
+::::note[Verified drift]
+[ADR 11](/adr/platform-keybindings) says the toolbar label comes from a single
+`command_palette_shortcut()` function. No such function exists anywhere in the
+repository; grep finds only the ADR sentence and a stale comment pointing at the
+same name in `crates/ui/src/actions.rs:52`. The real mechanism is
+`Kbd::binding_for_action` at the two call sites above.
+::::
+
+## Re-registered bindings
+
+Four chords are bound a second time, on `gpui-component`'s own `Input` context:
+
+```rust crates/ui/src/actions.rs:89-92
+KeyBinding::new("tab", CycleFocus, Some("Input")),
+KeyBinding::new("up", SelectPrev, Some("Input")),
+KeyBinding::new("down", SelectNext, Some("Input")),
+KeyBinding::new("secondary-c", CopyUrl, Some("Input")),
+```
+
+The component binds all four itself. A binding on an **ancestor** context never
+beats one on the focused node, so binding them on `Starlet` alone would have no
+effect while the input has focus — which is most of the time. The only way to
+give them product meaning is to re-register them on `Input`, where registration
+order decides the winner and `gpui_component::init` has already run
+(`crates/ui/src/actions.rs:79-83`).
+
+::::warning[Only safe because there is no multi-line text entry]
+Starlet has exactly one text field and it is single-line. Nothing needs `Tab` to
+indent, `↑`/`↓` to move a caret between lines, or `Cmd+C` to copy the query text
+you just typed — the object every one of these commands acts on is the
+highlighted repository (`crates/ui/src/actions.rs:85-88`). Add a multi-line
+editor and all four of these need rethinking before it can hold focus.
+::::
+
+## Escape cascade
+
+`Dismiss` (`crates/ui/src/search.rs:691-714`) tries five things in order and
+returns after the first that applies:
+
+1. A sheet is open → close the sheet (`:692-695`).
+2. A dialog is open → close the dialog (`:696-699`).
+3. The welcome/sign-in screen is showing → decline it, **but only if there is
+   already a mirror to search** (`:702-707`). With an empty database Escape does
+   nothing, because dismissing an offer to sign in when there is nothing to look
+   at would leave a blank window. With repositories present, it drops you into
+   offline search.
+4. The query is non-empty → clear it (`:708-712`).
+5. Otherwise → focus the search input (`:713`).
+
+The two-step ordering is what `crates/ui/tests/overlays.rs:126` and `:151` were
+written to catch: an overlay must swallow Escape before the query does.
+
+## Sidebar behaviour
+
+`is_sidebar_open` is `sidebar_choice.unwrap_or(!is_home())`
+(`crates/ui/src/search.rs:783-785`). `sidebar_choice` is an `Option<bool>`:
+
+- **`None`** — the sidebar follows the query. Closed on the home screen, open
+  once you have typed something.
+- **`Some(_)`** — you pressed `Cmd+B`, and that decision is pinned for the rest
+  of the session. `toggle_sidebar` sets it explicitly
+  (`crates/ui/src/search.rs:716-721`), and the query stops deciding for someone
+  who has already decided.
+
+## See also
+
+- [`ui`](/crates/ui) — the crate that owns the actions, the contexts, and every
+  handler cited above.
+- [ADR 11 — platform keybindings](/adr/platform-keybindings).

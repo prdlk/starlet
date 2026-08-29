@@ -1,0 +1,459 @@
+---
+title: store
+description: The only crate that knows SQL exists — one SQLite file, one sqlx pool, the schema, the migrations, and every DAO in the application.
+sidebar:
+  label: store
+  icon: database
+---
+
+`starlet-store` (lib `starlet_store`) owns every byte that touches disk: one
+SQLite file, one `sqlx` connection pool, the schema, the migrations, and the
+DAOs for repos, tags, groups, key/value state, AI-run history, and the FTS5
+index. It is the only crate in the workspace that knows SQL exists.
+
+It must never rank, parse queries, or fuzzy-match — that is
+[`core`](/crates/core), and the two halves are combined in `starlet_core::rank`
+(`crates/store/src/fts.rs:1-4`). It must never block the UI thread. And it must
+never resolve the `STARLET_DB` override itself: the crate offers
+`default_database_path()` and nothing more, while the binary reads the env var
+(`crates/app/src/main.rs:45-48`).
+
+::::info[Every method is `async`, and none of them may run in `render`]
+"Every method here is `async` and runs on the caller's Tokio runtime. The UI
+never calls these directly from `render`; it goes through the background
+executor and applies results on the application thread"
+(`crates/store/src/lib.rs:7-9`). That is the crate's defining constraint —
+see [Runtime](/architecture/runtime) for the bridge that enforces it.
+::::
+
+## Modules
+
+| Module | Contents |
+| --- | --- |
+| `lib.rs` | `Store`, `StoreError`, `Result`, pool/WAL configuration, `migrate`, `default_database_path` |
+| `repos.rs` | The `repos` table: positional `RepoRow`, `REPO_COLUMNS`, load/upsert/delete and the lazily-fetched column accessors |
+| `taxonomy.rs` | `tags`, `repo_tags`, `"groups"`, `repo_groups`; `TagFacet`, `GroupFacet` |
+| `fts.rs` | `search_fts`, the four BM25 column weights, `build_match`, `FtsHit` |
+| `state.rs` | The `sync_state` key/value table and the seven `KEY_*` constants |
+| `ai_runs.rs` | `AiRun` and the three run-history methods |
+| `time.rs` | `format_ts` / `parse_ts` — RFC 3339 UTC, second precision |
+
+Every module is **private** (`crates/store/src/lib.rs:16-21`); the public types
+are re-exported flat from `lib.rs` (`:23-30`). Adding a module means declaring
+it in that `mod` list and re-exporting from that `pub use` block — there is no
+other registration point.
+
+## Opening a store
+
+```rust crates/store/src/lib.rs
+pub async fn Store::open(path: impl AsRef<Path>) -> Result<Self>   // :61
+pub async fn Store::open_in_memory() -> Result<Self>               // :81
+pub fn       Store::pool(&self) -> &Pool<Sqlite>                   // :115
+pub async fn Store::close(&self)                                   // :120
+pub fn       default_database_path() -> Result<PathBuf>            // :130
+```
+
+`Store` is `Clone + Debug` and wraps exactly one `Pool<Sqlite>`
+(`crates/store/src/lib.rs:54-57`), so cloning it is free and every clone shares
+the same pool.
+
+**File-backed configuration** (`crates/store/src/lib.rs:66-75`), in full:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `journal_mode` | `Wal` | The sync worker writes while the UI reads (`:3-5`) |
+| `synchronous` | `Normal` | Documented safe pairing with WAL. A crash can lose the tail of the last transaction, which for a rebuildable mirror of GitHub is not worth an fsync per commit (`:70-72`) |
+| `foreign_keys` | `true` | `ON DELETE CASCADE` is inert without it |
+| `busy_timeout` | 10 s | Writer/reader contention waits instead of erroring |
+| `create_if_missing` | `true` | First launch has no file |
+
+The parent directory is created first (`:62-65`). The pool is
+`max_connections(4)` with default min, idle timeout and lifetime
+(`crates/store/src/lib.rs:100-104`). `close()` closes the pool and lets WAL
+checkpoint on the last connection drop (`:119-122`).
+
+**Migrations run on open for both constructors.** `open` reaches
+`from_options` (`:77`, `:100-108`) and `open_in_memory` calls it directly
+(`:96`); both land in `sqlx::migrate!("./migrations").run(&self.pool)`
+(`:110-113`). There is no separate "migrate" step a caller can forget.
+
+::::warning[`open_in_memory` pins the pool to exactly one connection]
+`max_connections(1).min_connections(1).idle_timeout(None).max_lifetime(None)`
+(`crates/store/src/lib.rs:88-93`), because "a shared-cache in-memory database
+disappears when the last connection closes" (`:86-87`). Raising it to 4 to
+match the file-backed pool destroys the database mid-test, intermittently and
+confusingly. Do not "optimise" it.
+::::
+
+### `StoreError`
+
+Five variants (`crates/store/src/lib.rs:34-49`):
+
+| Variant | Raised by |
+| --- | --- |
+| `Sqlx(sqlx::Error)` | Any query or connection failure; `#[from]` |
+| `Migrate(sqlx::migrate::MigrateError)` | A migration that fails to apply, or a **changed checksum** on an already-applied file |
+| `Json { column, source }` | A JSON column that will not parse. Carries the offending column name |
+| `NoDataDir` | `directories` could not name a data directory on this platform |
+| `Io(std::io::Error)` | Creating the parent directory failed; `#[from]` |
+
+`pub type Result<T, E = StoreError>` (`:51`) is the crate-wide alias every DAO
+returns.
+
+### The default path
+
+`default_database_path()` builds
+`ProjectDirs::from("dev", "starlet", "starlet")` and joins `starlet.db` onto its
+data directory (`crates/store/src/lib.rs:130-134`), yielding
+`<data dir>/starlet/starlet.db`:
+
+| Platform | Path |
+| --- | --- |
+| Linux | `~/.local/share/starlet/starlet.db` |
+| macOS | `~/Library/Application Support/starlet/starlet.db` |
+| Windows | `%APPDATA%\starlet\data\starlet.db` |
+
+Documented in place at `crates/store/src/lib.rs:125-129`. A platform with no
+data directory yields `StoreError::NoDataDir`. The `STARLET_DB` override is
+resolved one layer up in the binary; see [Environment](/reference/environment)
+and, for a throwaway corpus, [Demo database](/getting-started/demo-database).
+
+## The repos DAO
+
+Every method is an `impl Store` in `crates/store/src/repos.rs`.
+
+| Signature | Semantics | Cite |
+| --- | --- | --- |
+| `load_repos() -> Result<Vec<Repo>>` | Every repo with tags and groups attached, **without** contributors. Three queries total, not N+1 | `:130-147` |
+| `load_repo(id) -> Result<Option<Repo>>` | One repo with everything, contributors included | `:150-161` |
+| `repo_count() -> Result<i64>` | `SELECT count(*) FROM repos`; the local half of the sync count check | `:163-168` |
+| `upsert_repos(&[Repo]) -> Result<u64>` | One transaction; per-row `INSERT … ON CONFLICT (id) DO UPDATE` with preservation rules, then `sync_github_topics` in the same tx. Early-returns `Ok(0)` on empty | `:174-247` |
+| `delete_repos(&[i64]) -> Result<u64>` | Per-id `DELETE` in one tx; cascades to `repo_tags` and `repo_groups` | `:250-265` |
+| `known_ids() -> Result<HashSet<i64>>` | The local id set the unstar diff is computed against | `:268-275` |
+| `stale_ids(before) -> Result<Vec<(i64, String, Option<String>)>>` | `(id, full_name, etag)` where `synced_at IS NULL OR synced_at < ?`, `ORDER BY synced_at ASC` — oldest first | `:278-292` |
+| `set_etag(id, Option<&str>)` | Store a conditional-request validator | `:295-302` |
+| `touch_synced_at(id, at)` | Freshness bump with no content change — the `304` path | `:306-313` |
+| `set_languages(id, &LanguageBytes)` | Overwrite `languages_json` | `:315-322` |
+| `ids_without_languages(limit) -> Result<Vec<(i64, String)>>` | Backfill worklist: rows where `languages_json = '{}'`, `ORDER BY stargazers DESC` | `:325-336` |
+| `set_contributors(id, &[Contributor])` | Overwrite `contributors_json` | `:338-345` |
+| `readme(id, not_before) -> Result<Option<String>>` | The cached README, but only if `readme_fetched_at >= not_before`; otherwise `None` | `:348-360` |
+| `set_readme(id, markdown, at)` | Write the cache body and the fetch stamp together | `:362-370` |
+| `repo_id_by_full_name(&str) -> Result<Option<i64>>` | `owner/name` → GitHub id. Exists only because AI results address repos by the name the model was shown (`:413-415`) | `:416-425` |
+
+Private helpers: `all_repo_tags` (`:372-392`) and `all_repo_groups`
+(`:394-408`), the two bulk joins that make `load_repos` three queries instead of
+`2n + 1`.
+
+### The preserving upsert
+
+The `ON CONFLICT` clause overwrites most columns from `excluded`, but three are
+protected because a star-listing refresh cannot know them
+(`crates/store/src/repos.rs:198-217`):
+
+- `languages_json = CASE WHEN excluded.languages_json = '{}' THEN repos.languages_json ELSE excluded.languages_json END` (`:208-210`) — an empty map means "no information", not "no languages".
+- `contributors_json = coalesce(excluded.contributors_json, repos.contributors_json)` (`:211`); the Rust side maps an empty `Vec` to SQL `NULL` first (`:185-189`).
+- `starred_at = coalesce(excluded.starred_at, repos.starred_at)` (`:212`).
+
+`etag`, `readme_md` and `readme_fetched_at` are **not in the INSERT column list
+at all** (`:193-197`), so the upsert structurally cannot touch them.
+
+::::danger[`RepoRow` is decoded by index, and `REPO_COLUMNS` is the only record of that order]
+`RepoRow` has a hand-written `FromRow` that pulls every field by position
+(`crates/store/src/repos.rs:40-63`) rather than by name, because "the derive
+looks every column up by name, which at eighteen columns and five thousand rows
+costs more than the query itself" (`:14-17`). `REPO_COLUMNS`
+(`crates/store/src/repos.rs:65-67`) is the single definition of that order.
+
+Add a column to the `SELECT` list without adding the matching `try_get` to
+`from_row` **at the same index** and the row decodes silently wrong: every field
+after the insertion point shifts by one. There is no compile error and no
+runtime error — just wrong data. Change `REPO_COLUMNS`, `RepoRow` and
+`from_row` in one edit, always.
+::::
+
+`load_repos` calls `into_repo(false)` (`crates/store/src/repos.rs:137`) and
+**never populates `contributors`**; only `load_repo` passes `true` (`:157`).
+Reading `repo.contributors` off a list-loaded repo gives you an empty vec, not
+the truth.
+
+## Tags and groups
+
+| Item | Semantics | Cite |
+| --- | --- | --- |
+| `TagFacet { name, source, count }` | Sidebar facet row | `crates/store/src/taxonomy.rs:15-20` |
+| `GroupFacet { name, summary, count }` | Group facet row | `:23-28` |
+| `set_ai_tags(repo_id, &[RepoTag])` | Deletes every `source='ai'` link for the repo, then inserts, **skipping any name that case-insensitively matches an existing user tag** | `:107-145` |
+| `add_user_tag(repo_id, name)` | Trims, no-ops on empty, idempotent via `DO NOTHING`, confidence `1.0` | `:148-165` |
+| `promote_tag(repo_id, name)` | `add_user_tag`, then `remove_tag(.., Ai)` | `:168-171` |
+| `remove_tag(repo_id, name, source)` | Unlinks one `(name, source)` from one repo; the `tags` row survives | `:173-184` |
+| `tag_facets() -> Vec<TagFacet>` | Inner join, so only tags in use; `ORDER BY n DESC, t.name ASC` | `:187-205` |
+| `replace_ai_groups(&[Group]) -> usize` | Deletes every `source='ai'` group, re-inserts, links members **by `full_name`**. Returns links made | `:211-246` |
+| `group_facets() -> Vec<GroupFacet>` | LEFT join, so an empty group appears with count 0 | `:248-265` |
+| `prune_orphan_tags() -> u64` | `DELETE FROM tags WHERE id NOT IN (SELECT tag_id FROM repo_tags)` | `:268-274` |
+
+Crate-internal: `tag_id` (`:31-41`), `sync_github_topics` (`:44-69`), and
+`Store::repo_tags` / `Store::repo_groups` (`:72-102`).
+
+### Three sources, and who may overwrite whom
+
+The separation is what makes "never overwrite a user tag with an AI tag" a
+property of the schema rather than a rule someone has to remember
+(`crates/store/src/taxonomy.rs:3-7`).
+
+| Source | Owner | Write path | Lifetime |
+| --- | --- | --- | --- |
+| `github` | sync | `sync_github_topics`, inside the `upsert_repos` transaction (`crates/store/src/repos.rs:242`) | Replaced wholesale each sync, so a topic removed upstream disappears locally |
+| `ai` | an analysis run | `set_ai_tags` | Replaced wholesale each run |
+| `user` | the user | `add_user_tag` / `promote_tag` / `remove_tag` | Never deleted by sync or by an AI run |
+
+`set_ai_tags` reads the repo's existing **user** tag names lowercased
+(`crates/store/src/taxonomy.rs:117-126`) and skips any incoming AI tag already
+in that set (`:128-131`). So for identical names, user beats AI, and the AI
+duplicate is dropped rather than stored.
+
+The SQL-level detail — column types, the eight indexes, the five FTS triggers —
+lives in [Database schema](/reference/database-schema).
+
+Two traps in this module:
+
+- **`ORDER BY t.source DESC` is a string sort.** Used in both
+  `Store::repo_tags` (`crates/store/src/taxonomy.rs:76`) and `all_repo_tags`
+  (`crates/store/src/repos.rs:376`), it happens to yield `user` > `github` >
+  `ai`, which is the intended precedence, but only by alphabetical accident. A
+  fourth source lands wherever its name falls. Related: the fallback
+  `TagSource::parse(..).unwrap_or(TagSource::Github)`
+  (`crates/store/src/taxonomy.rs:85-86`, `:199-200`,
+  `crates/store/src/repos.rs:386-387`) silently relabels an unknown source as
+  GitHub.
+- **`promote_tag` is two transactions, not one**
+  (`crates/store/src/taxonomy.rs:168-171`). `add_user_tag` commits, then
+  `remove_tag` commits. A crash between them leaves both a user copy and the AI
+  original attached to the repo.
+
+## Full-text search
+
+```rust crates/store/src/fts.rs
+const W_FULL_NAME: f32 = 1.0;    // :25
+const W_DESCRIPTION: f32 = 5.0;  // :26
+const W_TOPICS: f32 = 3.0;       // :27
+const W_TAGS: f32 = 4.0;         // :28
+
+pub async fn Store::search_fts(
+    &self, terms: &[String], limit: i64,
+) -> Result<HashMap<i64, f32>>   // :36
+```
+
+The four weights are passed to `bm25()` in **table-declaration order**
+(`crates/store/src/fts.rs:42-44`), so the weight list and the FTS5 column list
+are a positional pair. `full_name` is deliberately the lowest: "the fuzzy
+matcher already owns that field and gets 70 % of the final score. What FTS
+contributes that nucleo cannot is the description and the tag vocabulary"
+(`:22-24`).
+
+SQLite's `bm25()` is negative, better-is-more-negative. `search_fts` selects
+`-bm25(...)` and orders by it descending (`crates/store/src/fts.rs:42-43`), so
+the map it returns is positive and bigger-is-better before it reaches the
+blend. How that map is combined with the fuzzy score is
+[Search pipeline](/architecture/search-pipeline); the arithmetic is
+[Ranking](/reference/ranking).
+
+`build_match` (`crates/store/src/fts.rs:77-95`) is the sanitiser. Each term is
+filtered to alphanumerics plus `_ - . / "` (`:80-83`), trimmed of
+non-alphanumeric edges (`:84`), then emitted as `"term"*` with embedded quotes
+doubled (`:88`), and the parts joined with `AND` (`:93`). FTS5 operators the
+user typed (`OR`, `NEAR`, `-`, `^`) become data, not syntax (`:74-76`). A
+punctuation-only term is dropped (`:85-87`); if every term is dropped the
+function returns `None` and `search_fts` short-circuits to an empty map
+(`:37-39`).
+
+::::note[A malformed MATCH is not an error]
+`sqlx::Error::Database` from the FTS query is logged at `debug` and swallowed
+into an empty map (`crates/store/src/fts.rs:53-60`) — "a malformed MATCH
+expression is a user typing, not a bug" (`:51-52`). Non-database errors still
+propagate. If full-text results vanish for one keystroke, look in the debug log
+for `fts match rejected`, not for an exception.
+::::
+
+`FtsHit` (`crates/store/src/fts.rs:13-18`) is exported from the crate root
+(`crates/store/src/lib.rs:24`) but **never constructed anywhere in this crate** —
+`search_fts` returns a `HashMap<i64, f32>` instead.
+
+## State, AI runs, timestamps
+
+### `sync_state`
+
+Two namespaces share one key/value table: `sync.*` for the engine's cursors,
+`ui.*` for interface state that must survive a restart
+(`crates/store/src/state.rs:3-4`).
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `KEY_STAR_WATERMARK` | `sync.star_watermark` | Timestamp of the newest star seen by a completed sync (`crates/store/src/state.rs:11`) |
+| `KEY_LAST_SYNC` | `sync.last_sync` | RFC 3339 stamp of the last successful run (`:13`) |
+| `KEY_INITIAL_SYNC_DONE` | `sync.initial_done` | `"1"` once the first full page-through completed (`:15`) |
+| `KEY_COLUMN_WIDTHS` | `ui.column_widths` | Table column widths as a JSON array of floats (`:17`) |
+| `KEY_AI_PROVIDER` | `ui.ai_provider` | Selected AI provider id (`:19`) |
+| `KEY_AI_MODEL` | `ui.ai_model` | Selected model for that provider (`:21`) |
+| `KEY_AI_ENDPOINT` | `ui.ai_endpoint` | Base URL override, used by the Ollama provider (`:23`) |
+
+```rust crates/store/src/state.rs
+pub async fn get_state(&self, key: &str) -> Result<Option<String>>  // :26
+pub async fn set_state(&self, key: &str, value: &str) -> Result<()> // :37, upsert
+pub async fn clear_state(&self, key: &str) -> Result<()>            // :49
+```
+
+::::warning[The `ui.*` key set is split across two crates]
+`KEY_APPEARANCE` (`"ui.appearance"`) shares the `ui.*` namespace but is **not**
+defined here — it lives in `crates/ui/src/settings.rs:23`. Grepping
+`crates/store/src/state.rs` for the complete `ui.*` key list gives you six of
+seven. The binary reads it before the window exists
+(`crates/app/src/main.rs:55-64`).
+::::
+
+### `ai_runs`
+
+`AiRun` (`crates/store/src/ai_runs.rs:13-23`) carries `id`, `provider`, `model`,
+`started_at`, `finished_at`, `repos_count`, `cost_estimate`. The table exists so
+Settings can show what the last run cost and so "a cancelled run is
+distinguishable from one that never happened" (`:3-4`).
+
+| Method | Semantics | Cite |
+| --- | --- | --- |
+| `begin_ai_run(provider, model, repos) -> i64` | Inserts with `started_at = now`, `RETURNING id` | `:27-39` |
+| `finish_ai_run(id, repos, cost)` | Sets `finished_at = now` plus the final counts | `:42-53` |
+| `recent_ai_runs(limit) -> Vec<AiRun>` | `ORDER BY id DESC LIMIT ?` | `:55-76` |
+
+**A cancelled run is one whose `finished_at` stays `NULL`**
+(`crates/store/src/ai_runs.rs:18-19`, `:41`). There is no cancelled flag and
+nothing to clean up: the row simply never gets its second write.
+
+### Timestamps
+
+```rust crates/store/src/time.rs
+pub fn format_ts(ts: &DateTime<Utc>) -> String                 // :10
+pub fn parse_ts(raw: Option<&str>) -> Option<DateTime<Utc>>    // :16
+```
+
+Every timestamp column is RFC 3339 in UTC. Encoding is explicit rather than
+delegated to a driver mapping "so the on-disk representation cannot change
+under a dependency bump" (`crates/store/src/time.rs:3-5`) — which is why `sqlx`
+has its `chrono` feature enabled and the crate still formats by hand.
+`format_ts` is always second precision with a `Z` suffix (`:11`). `parse_ts`
+returns `None` for anything unparseable rather than failing: "a bad timestamp
+costs a sort key, not a repo" (`:14-15`).
+
+## Key invariants
+
+- **`repos_fts.rowid == repos.id`, always**
+  (`crates/store/migrations/0001_init.sql:91`). Everything currently writes the
+  FTS table through triggers; a new direct write path must honour it or the
+  join key silently points at the wrong repo.
+- **There is no `AFTER UPDATE ON repo_tags` trigger.** Insert (`:118`) and
+  delete (`:126`) recompute the FTS `tags` column; changing only `confidence`
+  does not. Harmless today because the FTS column holds names, not confidences.
+- **`repos_fts_update` deliberately does not write `tags`** (`:109-110`), so a
+  metadata refresh cannot drop tag text.
+- **`prune_orphan_tags` is manual.** `ON DELETE CASCADE` removes the
+  `repo_tags` rows but leaves the `tags` row behind
+  (`crates/store/src/taxonomy.rs:268-274`); nothing in this crate calls prune
+  automatically.
+- **`replace_ai_groups` links members by `full_name`**
+  (`crates/store/src/taxonomy.rs:230-242`), so a repo renamed between group
+  generation and linking is silently dropped from its group. It also deletes
+  only `source='ai'` groups (`:213`), so a future user-created group survives.
+- **JSON serialisation failures are swallowed.**
+  `unwrap_or_else(|_| "{}".into())` in `upsert_repos`
+  (`crates/store/src/repos.rs:183`) and `set_languages` (`:317`), `"[]"` in
+  `set_contributors` (`:340`), `.ok()` for contributors on upsert (`:188`). In
+  practice `BTreeMap<String, i64>` and `Vec<Contributor>` cannot fail to
+  serialise; if you add a type that can, it will fail as an empty value rather
+  than an error.
+- **`upsert_repos` returns summed `rows_affected`**
+  (`crates/store/src/repos.rs:240`). For `INSERT … ON CONFLICT DO UPDATE`
+  SQLite counts updates too, so this is a "rows touched" count, never an
+  "inserted" count.
+- **`languages_json = '{}'` and `topics_json = '[]'` are the schema defaults**
+  and the common case, so the row decoder short-circuits JSON parsing on them.
+  `ids_without_languages` keys off exactly that literal
+  (`crates/store/src/repos.rs:327`), which means "backfilled and genuinely
+  empty" is indistinguishable from "never backfilled".
+
+## Tests
+
+| Location | Pattern | Covers |
+| --- | --- | --- |
+| `src/lib.rs:140-151` | `#[tokio::test]` | `migrations_apply_and_fts5_is_available` — selects from `repos_fts` so a libsqlite3 built without FTS5 fails loudly here instead of silently degrading search (`:143-145`) |
+| `src/lib.rs:153-162` | `#[tokio::test]` + `tempfile` | `wal_mode_is_active_on_a_real_file` — `PRAGMA journal_mode` against a real file |
+| `src/fts.rs:97-123` | plain `#[test]` | `build_match`: quoted prefixes ANDed, FTS5 operators neutralised, punctuation-only terms dropped |
+| `src/time.rs:23-49` | plain `#[test]` | Round-trip to the second, GitHub's `+02:00` offset form, garbage decoding to `None` |
+| `tests/store.rs` | 14 × `#[tokio::test]` | See below |
+| `tests/search_performance.rs:61`, `:90` | timing | Two budgets over a 5 000-repo corpus |
+
+`tests/store.rs` runs every case against `Store::open_in_memory()` with the
+**real migrations**, because the behaviour under test lives in SQL rather than
+in Rust. A shared `seeded()` fixture (`:39`) inserts helix, bat and ripgrep.
+
+| Test | Line |
+| --- | --- |
+| `upsert_then_load_round_trips_every_field` | `:63` |
+| `topics_become_github_tags_and_track_edits` | `:82` |
+| `ai_tags_never_displace_user_tags` | `:105` |
+| `promoting_an_ai_tag_makes_it_a_user_tag` | `:154` |
+| `fts_finds_repos_by_description_and_ranks_them` | `:176` |
+| `fts_index_tracks_tags_and_deletions` | `:208` |
+| `fts_index_follows_a_description_change` | `:252` |
+| `a_refresh_preserves_lazily_fetched_columns` | `:280` |
+| `a_stale_readme_reads_as_absent` | `:327` |
+| `groups_link_by_full_name_and_ignore_unknown_members` | `:336` |
+| `tag_facets_are_counted_and_ordered` | `:381` |
+| `stale_ids_respect_the_watermark` | `:390` |
+| `key_value_state_round_trips` | `:405` |
+| `ai_runs_record_start_and_finish` | `:438` |
+| `unstarring_cascades_to_tags_and_groups` | `:455` |
+
+`tests/search_performance.rs` seeds `CORPUS = 5_000` synthetic repos (`:14`).
+`full_text_search_answers_within_a_frame_or_two` (`:61`) warms the page cache,
+then asserts the median of five terms is under `BUDGET_MS = 60.0` (`:19`).
+`loading_the_whole_mirror_is_fast_enough_for_a_cold_start` (`:90`) asserts
+`load_repos` finishes in under 800 ms (`:105`).
+
+Both budgets are deliberately loose. The measured median on the reference
+machine is 3–4 ms, "comfortably inside two frames at 120 Hz. The assertion sits
+far above that because a shared CI runner is several times slower; it is here
+to catch a missing index or a full table scan, not to police milliseconds"
+(`crates/store/tests/search_performance.rs:15-18`). Treat a failure as
+"something became O(n)", not as a regression of a few percent. See
+[Testing](/development/testing).
+
+## Extension points
+
+- **A schema change** → [Add a migration](/guides/add-a-migration). Never edit
+  `0001_init.sql`: `sqlx` checksums applied migrations, and a changed checksum
+  becomes `StoreError::Migrate` on every existing install.
+- **A new column that sync writes** →
+  [Add a synced field](/guides/add-a-synced-field), which walks the wire struct,
+  the model, the migration, `REPO_COLUMNS`, `RepoRow`, and the `upsert_repos`
+  bind order in one pass.
+- **A new `sync_state` key** → add a `pub const KEY_X: &str = "sync.x"` (or
+  `"ui.x"`) beside the others at `crates/store/src/state.rs:11-23` and
+  re-export it from `crates/store/src/lib.rs:25-28`. No schema change:
+  `sync_state` is free-form. Keep it here rather than in the consuming crate
+  unless it is genuinely UI-private.
+- **A new DAO method** → put it in an `impl Store` block in the module that owns
+  the table. Take `&self`. Use `self.pool()` for a single statement and
+  `self.pool().begin()` when several statements must be atomic. Return
+  `crate::Result<T>` and decode positionally with `row.try_get(<index>)?`. A
+  helper that must join an existing transaction takes
+  `&mut Transaction<'_, Sqlite>` instead of `&self`, like `sync_github_topics`
+  (`crates/store/src/taxonomy.rs:44-48`) and `tag_id` (`:31`).
+
+## Known cruft
+
+- **`FtsHit` is dead.** Declared at `crates/store/src/fts.rs:13-18` and
+  re-exported at `crates/store/src/lib.rs:24`, constructed nowhere. Either
+  `search_fts` should return `Vec<FtsHit>` or the type should go.
+- **`ids_without_languages` has a stale doc comment.** It says "oldest star
+  first" (`crates/store/src/repos.rs:324`) while the query is
+  `ORDER BY stargazers DESC` (`:328`) — most-starred first. The SQL is the
+  intended behaviour (backfill the repos a user is most likely to open); the
+  comment is wrong.

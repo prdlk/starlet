@@ -1,0 +1,150 @@
+---
+title: GitHub App
+description: Register your own GitHub App, enable the device flow, and supply the client ID at build or run time. Starlet ships no client secret and embeds no browser.
+sidebar:
+  label: GitHub App
+  icon: github
+---
+
+Starlet authenticates as a **GitHub App** using the device flow, so there is no
+client secret to embed and no OAuth redirect to host. You register your own App
+once; the client ID is not a secret and is the only thing Starlet needs.
+
+The reasoning is in [ADR 7](/adr/github-app-device-flow).
+
+## Register the App
+
+<Steps>
+  <Step title="Create it">
+    **Settings → Developer settings → GitHub Apps → New GitHub App**, or
+    [github.com/settings/apps/new](https://github.com/settings/apps/new).
+
+    **GitHub App name**: anything, for example `Starlet (yourname)`.
+    **Homepage URL**: anything, for example the repository.
+
+  </Step>
+  <Step title="Enable the device flow">
+    Under **Identifying and authorizing users**, tick **Enable Device Flow**.
+
+    This is the setting that makes the whole flow work. Without it the sign-in
+    dialog reports that the request was rejected — the device-code endpoint
+    answers with a form-encoded error, which surfaces as
+    `SyncError::Auth("unexpected device code response: …")`.
+
+  </Step>
+  <Step title="Turn off the webhook">
+    Untick **Webhook → Active**. Starlet is a client; nothing calls back.
+  </Step>
+  <Step title="Grant exactly one permission">
+    **Permissions → Account permissions**: set **Starring** to **Read-only**.
+    That is the only permission Starlet needs, and asking for more would be a
+    lie.
+  </Step>
+  <Step title="Scope and install">
+    **Where can this GitHub App be installed?** → **Only on this account**.
+    Create the App, then **Install App** on your own account.
+  </Step>
+  <Step title="Copy the client ID">
+    From the App's settings page. It looks like `Iv23li…`.
+  </Step>
+</Steps>
+
+## Supply the client ID
+
+`client_id()` in `crates/sync/src/auth.rs:30` resolves it in two steps: the
+`STARLET_GITHUB_CLIENT_ID` **environment variable** at runtime wins; otherwise
+the `option_env!` value baked in at **compile time**. Empty or whitespace-only
+counts as absent.
+
+<Tabs>
+  <Tab title="Bake it in at build time">
+
+```sh
+STARLET_GITHUB_CLIENT_ID=Iv23liXXXXXXXXXXXXXX cargo build --release
+```
+
+  </Tab>
+  <Tab title="Supply it at run time">
+
+```sh
+STARLET_GITHUB_CLIENT_ID=Iv23liXXXXXXXXXXXXXX cargo run --release
+```
+
+  </Tab>
+</Tabs>
+
+Without a client ID Starlet still runs: it searches whatever is already in the
+local database and tells you the ID is missing when you try to sign in.
+
+## What happens when you click Sign in
+
+Two endpoints, both on `github.com` — not `api.github.com`
+(`crates/sync/src/auth.rs:22-23`):
+
+```mermaid
+sequenceDiagram
+    participant UI as signin.rs
+    participant DF as DeviceFlow
+    participant GH as github.com
+    participant KC as OS keychain
+
+    UI->>DF: request_code()
+    DF->>GH: POST /login/device/code
+    GH-->>DF: user_code, verification_uri, interval, expires_in
+    DF-->>UI: DeviceGrant
+    Note over UI: show the code; user types it into the browser
+    loop every `interval` seconds until `expires_in`
+        UI->>DF: poll_once(device_code)
+        DF->>GH: POST /login/oauth/access_token
+        GH-->>DF: 200 { error } or 200 { access_token }
+        DF-->>UI: Pending | SlowDown(d) | Authorized(token)
+    end
+    UI->>KC: TokenStore::save(token)
+```
+
+`poll_once` **never sleeps**. The interval, the deadline, and cancellation are
+owned by the caller — `crates/ui/src/signin.rs:99-160` — so a closed dialog stops
+polling immediately.
+
+### Every outcome the token endpoint can produce
+
+The status is deliberately not checked: GitHub answers `200` with an `error`
+field. Dispatch is on the parsed body (`crates/sync/src/auth.rs:146`):
+
+| Response | `PollOutcome` / error | Behaviour |
+| --- | --- | --- |
+| `access_token` present | `Authorized(token)` | Checked *first*, before `error`. |
+| `error: authorization_pending` | `Pending` | Keep polling at the current interval. |
+| `error: slow_down` | `SlowDown(Duration)` | From the body's `interval`, default **10 s**, clamped to ≥ 1 s. The caller replaces its interval permanently. |
+| `error: expired_token` | `Err(Auth("the sign-in code expired; start again"))` | Terminal. |
+| `error: access_denied` | `Err(Auth("sign-in was declined"))` | Terminal. |
+| any other `error` | `Err(Auth(error_description ?? error))` | Terminal. |
+| neither token nor error | `Err(Auth("token response had no token and no error"))` | Terminal. |
+
+Every failure is `SyncError::Auth`, so `needs_reauth()` is `true` for all of
+them and the UI offers "sign in" rather than "retry".
+
+## Where the token goes
+
+The OS keychain, and nowhere else — never the database, never a config file,
+never a log line.
+
+| | |
+| --- | --- |
+| Service | `dev.starlet.starlet` (`KEYCHAIN_SERVICE`, `crates/sync/src/auth.rs:19`) |
+| Account | `github-token` (`crates/sync/src/auth.rs:20`) |
+| Backend | Keychain on macOS, Credential Manager on Windows, Secret Service on Linux |
+
+`TokenStore` is **fail-soft on read, fail-loud on write**: `load()` maps every
+keychain error to `None`, so a locked keychain reads as "signed out" rather than
+crashing; `save()` and `clear()` return `SyncError::Keychain`.
+
+::::warning[TokenStore is blocking]
+Platform keychain APIs are synchronous, so all three `TokenStore` methods block.
+The UI calls them through `Backend::spawn_blocking`
+(`crates/ui/src/signin.rs:163`). Calling them on an async executor thread will
+block it.
+::::
+
+`DeviceFlow` and `GitHub` both have hand-written `Debug` impls that print only
+the client ID and the base URL respectively, so a `dbg!` cannot leak the token.

@@ -1,0 +1,201 @@
+---
+title: core
+description: The I/O-free domain layer — the Repo model, a total query parser, and a two-signal ranker. No SQL, no GPUI, no network, and no error type.
+sidebar:
+  label: core
+  icon: box
+---
+
+`starlet-core` (lib `starlet_core`) owns the three things Starlet must be able to
+reason about without a database or a window: the **domain model**, the **query
+language**, and the **ranking formula**. Everything in it is a pure function of
+its inputs.
+
+::::info[There is no error type in this crate]
+Grep for `Error` in `crates/core/src` and you get nothing. `parse` is total by
+design, and `rank` takes the BM25 half of its input as an already-computed
+`HashMap<i64, f32>` rather than fetching it. What is *absent* from
+`crates/core/Cargo.toml` — no `sqlx`, no `reqwest`, no `gpui`, no `tokio` — is the
+crate's contract.
+::::
+
+## Modules
+
+| Module | Contents |
+| --- | --- |
+| `model` | `Repo`, `RepoTag`, `TagSource`, `Contributor`, `Group`, `RepoSummary`, `LanguageBytes` |
+| `query` | `Query`, `Clause`, `Filter`, `Field`, `StarRange`, `SortKey`, `parse` |
+| `rank` | `Ranker`, `Scored`, `FUZZY_WEIGHT`, `FTS_WEIGHT` |
+
+All three are re-exported flat from `lib.rs`, but downstream crates import
+through the module paths (`starlet_core::query::{self, Query, SortKey}`).
+
+## The model
+
+`Repo` (`crates/core/src/model.rs:17`) derives
+`Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize`. Fields worth
+knowing about:
+
+| Field | Type | Why it matters |
+| --- | --- | --- |
+| `id` | `i64` | GitHub's numeric id. **Stable across renames**, and the join key against the FTS index. |
+| `full_name` | `String` | `owner/name`. The **only** haystack the fuzzy matcher sees, and the secondary tie-break key. |
+| `stargazers` | `i64` | Primary tie-break, descending. |
+| `starred_at` | `Option<DateTime<Utc>>` | The default browse ordering. `None` sorts last. |
+| `last_commit_at` | `Option<DateTime<Utc>>` | GitHub's `pushed_at`. Sort key for `SortKey::Recent`. |
+| `languages` | `LanguageBytes` = `BTreeMap<String, i64>` | `BTreeMap`, not `HashMap`, so iteration order is deterministic — `Repo` derives `Eq` and is compared in tests. |
+| `contributors` | `Vec<Contributor>` | **Lazily loaded.** Sync leaves it empty; the detail sheet fills it on first open. Never assume it is populated. |
+| `topics` | `Vec<String>` | `Filter::Tag` matches these *in addition to* `tags`. |
+
+### Methods
+
+```rust
+pub fn language_total(&self) -> i64                  // model.rs:47
+pub fn languages_by_size(&self) -> Vec<(&str, i64)>  // model.rs:52
+pub fn has_tag(&self, name: &str) -> bool            // model.rs:63
+pub fn in_group(&self, name: &str) -> bool           // model.rs:67
+impl AsRef<Repo> for Repo                            // model.rs:74
+```
+
+`languages_by_size` sorts by bytes descending, ties broken by language name
+ascending — a total order, so the language bar never flickers.
+
+The reflexive `AsRef<Repo>` impl exists solely so `Ranker::rank<R: AsRef<Repo>>`
+accepts both `&[Repo]` and `&[Arc<Repo>]` without the caller cloning 5 000
+records per keystroke.
+
+### `TagSource`
+
+```rust
+pub enum TagSource { Github, Ai, User }   // model.rs:84
+```
+
+`Copy + Ord`, ordering is declaration order, so `Github < Ai < User`. **User tags
+are authoritative and are never overwritten by an AI run** — but that invariant is
+enforced in `store`, not here. `TagSource::parse` is exact and
+**case-sensitive**: `"GitHub"` returns `None`.
+
+### `RepoSummary`
+
+The trimmed projection sent to an AI provider — `full_name`, `description`,
+`topics`, `primary_language`. Every optional field carries
+`skip_serializing_if`, so absent data costs zero tokens.
+
+## The query parser
+
+`pub fn parse(input: &str) -> Query` (`crates/core/src/query.rs:139`). **Total.
+Never fails, never panics** — guarded by the `never_panics` property over
+arbitrary 0–200 character strings.
+
+The seven stages, and the traps in each, are documented in full in
+[Query syntax](/reference/query-syntax). The short version:
+
+```text
+query   := item (ws+ item)*
+item    := '-'? (field ':' value) | word
+field   := lang | language | tag | group | owner | user | stars | is | sort
+value   := '"' … '"' | word
+```
+
+Three behaviours a developer will otherwise get wrong:
+
+1. **An empty value is skipped, not text.** `parse("lang:")` yields
+   `Query::is_empty() == true`. This is what keeps a half-typed prefix from
+   blanking the result list.
+2. **`Query::text` is derived once**, at `query.rs:174`, as `terms.join(" ")`.
+   Mutating `terms` afterwards leaves it stale — and `has_text()` reads `text`,
+   not `terms`.
+3. **Negation polarity is split between two places.** `apply` may already encode
+   polarity (`is:active` → `Archived(negated)`), and `Clause::negated` is applied
+   again at evaluation time via `filter.matches(repo) != clause.negated`. Reading
+   `clause.filter` alone tells you nothing about the user's intent.
+
+### Evaluation
+
+```rust
+pub fn Query::matches(&self, repo: &Repo) -> bool   // query.rs:344
+pub fn Filter::matches(&self, repo: &Repo) -> bool  // query.rs:352
+```
+
+`Query::matches` ANDs every clause and **ignores `terms` entirely** — free text
+is scored, never filtered. An empty clause list matches everything.
+
+Every string comparison is `eq_ignore_ascii_case`, so non-ASCII case is **not**
+folded: `tag:CAFÉ` will not match `café`.
+
+Two filters are wider than their names suggest: `Filter::Language` matches
+`primary_language` *or any key of* `languages` (so 1 byte of Rust matches
+`lang:rust`), and `Filter::Tag` matches any tag source *or* a GitHub topic.
+
+## The ranker
+
+```rust
+pub const FUZZY_WEIGHT: f32 = 0.7;  // rank.rs:26
+pub const FTS_WEIGHT: f32 = 0.3;    // rank.rs:28
+
+pub struct Ranker { /* nucleo::Matcher + Vec<char> scratch */ }
+pub fn Ranker::rank<R: AsRef<Repo>>(
+    &mut self, query: &Query, repos: &[R], fts: &HashMap<i64, f32>,
+) -> Vec<Scored>                     // rank.rs:74
+```
+
+`Ranker` owns a `nucleo::Matcher` and a scratch buffer, both reused across calls.
+**It must be long-lived** — rebuilding it per keystroke throws away nucleo's
+internal slab. See [ADR 4](/adr/nucleo-matcher-not-injector).
+
+Sort selection: `query.sort` if present, otherwise `Relevance` when the query has
+text, otherwise `Starred`.
+
+The formula, the drop rule, and the tie-breaks are derived in
+[Ranking](/reference/ranking). The three things that bite:
+
+::::warning[Gotchas on the scoring path]
+- **`Scored.ix` indexes the exact slice you passed.** Reorder or reallocate
+  `repos` between the call and consuming the result and every row is mislabelled.
+- **`fts` is keyed by `Repo::id`, not by index.** Ids missing from the map score
+  zero; negative values are clamped to zero.
+- **Candidates with neither signal are dropped**, so
+  `rank(...).len() <= repos.len()` whenever the query has text. There is no 1:1
+  mapping.
+::::
+
+## Tests
+
+| Location | Pattern | Covers |
+| --- | --- | --- |
+| `src/query.rs:373-527` | plain `#[test]` | tokenization, every prefix, aliases and case, all five star-range forms including `1.5k`, `NotAValue` fallback, inert incomplete prefixes, negation polarity, the `is:active` inversion, quoted values, lone dash, `sort:` producing no clause |
+| `src/rank.rs:199-329` | plain `#[test]` | exact prefix outranks a looser hit, non-matches dropped, an FTS-only hit scores exactly `FTS_WEIGHT`, weighted-sum identity within `1e-6`, tie-break order, empty-query browse order, explicit `sort:` override |
+| `tests/query_proptest.rs` | `proptest`, 512 cases each | `never_panics`; `terms_are_well_formed`; `free_text_is_idempotent`; `known_prefixes_never_leak_into_text`; `negation_inverts_matching`; `star_ranges_are_inclusive`; `strict_and_inclusive_bounds_agree`; `incomplete_prefixes_are_inert` |
+| `tests/ranking_performance.rs` | timing, 10 ms budget | one-character query, filter+rank with three clauses, whole-corpus browse ordering |
+
+`free_text_is_idempotent` — re-parsing `query.text` is a fixed point — is relied
+on when the command palette rewrites the input.
+
+## Compile-time safety nets
+
+Two arrays have hard-coded lengths, on purpose:
+
+```rust
+pub const Field::ALL: [&'static str; 7]  // query.rs:76
+pub const SortKey::ALL: [SortKey; 5]     // query.rs:129
+```
+
+Add a variant and forget the array and you get a compile error, which is the
+intended guard. `crates/ui/src/palette.rs`'s `sort_token` match is exhaustive for
+the same reason.
+
+## Extension points
+
+- **A new query prefix** → [Add a query prefix](/guides/add-a-query-prefix).
+- **A new sort key** → `SortKey` variant, `parse` arm, `label` arm, bump
+  `SortKey::ALL`, and a `sort_by` arm in `rank.rs:155-190` that **must** end in
+  `.then_with(|| tie_break(...))` or the order stops being total and rows flicker
+  between renders.
+- **Changing the blend** → the two consts at `rank.rs:26,28`. Tests follow the
+  change automatically as long as the weights still sum to 1.0, since
+  `Scored::score` is documented as living in `0.0..=1.0`.
+
+## Known cruft
+
+`serde_json` and `thiserror` are declared in `crates/core/Cargo.toml` and have
+zero references in `crates/core/src`. Removing them is a safe, isolated cleanup.

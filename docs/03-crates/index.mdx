@@ -1,0 +1,50 @@
+---
+title: Crates
+description: What each of the six workspace crates owns, what it is forbidden from doing, and where its public surface lives.
+sidebar:
+  label: Crates
+  icon: package
+---
+
+Six crates. Each page below covers purpose, public API, invariants, and tests.
+The layering rule that relates them is in [Architecture](/architecture).
+
+| Crate | Lib name | Owns | Must never |
+| --- | --- | --- | --- |
+| [`core`](/crates/core) | `starlet_core` | Domain model, query language, ranking formula | Perform I/O, touch SQL, know GPUI exists, or fail |
+| [`store`](/crates/store) | `starlet_store` | The SQLite file, schema, migrations, FTS5 index, every DAO | Rank, parse queries, or block the UI thread |
+| [`sync`](/crates/sync) | `starlet_sync` | Device flow, keychain, the GitHub client, the sync engine | Know a window exists, or let a wire type escape upward |
+| [`ai`](/crates/ai) | `starlet_ai` | The provider trait, three backends, prompts, JSON recovery, cost model | Touch SQLite or GPUI |
+| [`ui`](/crates/ui) | `starlet_ui` | Every interface decision, the keymap, the theme, the two globals | Call `Store`/`GitHub`/keychain directly, or `block_on` |
+| [`app`](/crates/app) | `starlet` (bin) | Logging, runtime, DB open, theme install, globals, one window | Contain product logic |
+
+## Line counts
+
+A rough sense of where the weight is:
+
+| Crate | `src/` | `tests/` |
+| --- | --- | --- |
+| `core` | 1 031 | 257 |
+| `store` | 1 169 | 589 |
+| `sync` | 1 431 | 679 |
+| `ai` | 1 654 | 712 |
+| `ui` | 4 417 | 657 |
+| `app` | 100 | — |
+
+`crates/ui/src/search.rs` alone is 1 135 lines and is the central view; read it
+before changing anything in `ui`.
+
+## Test totals
+
+`just test` runs 181 tests. The distribution:
+
+| Crate | What is tested, and how |
+| --- | --- |
+| `core` | query parser (unit + 8 `proptest` properties × 512 cases), ranking order, three timing budgets |
+| `store` | 14 integration tests against in-memory SQLite with the real migrations, plus unit tests for the FTS sanitiser and timestamps |
+| `sync` | 15 `wiremock` fixtures: pagination, watermark, unstars, 304s, rate limits, device flow |
+| `ai` | JSON extraction against malformed samples, one `wiremock` suite per provider, batching and cancellation |
+| `ui` | 22 `#[gpui::test]` interaction and overlay tests plus unit tests for formatting, facets, and the palette |
+
+No crate uses `insta`; there is nothing worth snapshotting. See
+[Testing](/development/testing).

@@ -1,0 +1,190 @@
+---
+title: Testing
+description: How each crate is tested and why — proptest for the parser, real SQLite for the store, wiremock for the network, headless GPUI for the views, and wall-clock budgets for the hot paths.
+sidebar:
+  label: Testing
+  icon: flask-conical
+---
+
+181 tests, five strategies, one per kind of thing being asserted. The strategy is
+chosen by what the behaviour actually depends on.
+
+| Crate | Strategy | Because |
+| --- | --- | --- |
+| `core` | plain `#[test]` + `proptest` + timing | Pure functions. The parser's contract is *totality*, which is a property, not a case. |
+| `store` | `#[tokio::test]` against `Store::open_in_memory()` with the real migrations | The behaviour under test lives in SQL — triggers, `ON CONFLICT`, cascades. A mock would test the mock. |
+| `sync` | `wiremock` fixtures driving the real `SyncEngine` | Media types, `Link` pagination, `If-None-Match`, and GraphQL documents are the interesting part. |
+| `ai` | a hand-written `Stub` provider for orchestration, `wiremock` through `with_base_url` for the wire | Two separable concerns: the run loop, and each backend's transport. |
+| `ui` | `#[gpui::test]` on the headless platform layer | Overlay composition and focus routing cannot be asserted any other way. |
+
+No crate uses `insta`. There is nothing whose exact rendered form is the
+contract, and a snapshot would just capture incidental detail.
+
+## Property tests
+
+`crates/core/tests/query_proptest.rs`, eight properties at 512 cases each:
+
+| Property | Guarantees |
+| --- | --- |
+| `never_panics` | `parse` is total over arbitrary 0–200 character input. |
+| `terms_are_well_formed` | No empty term, and `text == terms.join(" ")`. |
+| `free_text_is_idempotent` | Re-parsing `query.text` is a fixed point. |
+| `known_prefixes_never_leak_into_text` | A recognised prefix never also becomes free text. |
+| `negation_inverts_matching` | `-p:v` and `p:v` always disagree. |
+| `star_ranges_are_inclusive` | Both bounds match; `lo-1` and `hi+1` do not. |
+| `strict_and_inclusive_bounds_agree` | `>n` ≡ `>=n+1`. |
+| `incomplete_prefixes_are_inert` | Every field name with an empty value parses to an empty query. |
+
+`free_text_is_idempotent` is not academic: it is what makes it safe for the
+command palette to rewrite the contents of the search input.
+
+::::tip[Adding a query prefix means adding to three property lists]
+`known_prefixes_never_leak_into_text`, `negation_inverts_matching`, and
+`incomplete_prefixes_are_inert` all enumerate the prefixes. See
+[Add a query prefix](/guides/add-a-query-prefix).
+::::
+
+## Store tests
+
+Fourteen `#[tokio::test]`s in `crates/store/tests/store.rs`, all against
+`Store::open_in_memory()` with the real migration applied. A shared `repo()`
+builder and a `seeded()` fixture (helix, bat, ripgrep) keep the cases short.
+
+What they pin down: field round-trip; topics becoming GitHub tags and
+disappearing when removed upstream; `ai_tags_never_displace_user_tags`;
+promotion; FTS by description with prefix and AND semantics; FTS tracking tag
+insert/delete and repo delete; FTS following a description change; lazily-fetched
+column preservation across a refresh; a stale README reading as absent; groups
+linking by `full_name` and ignoring unknowns; facet counting and ordering; the
+`stale_ids` watermark; key/value round-trip; AI run start/finish; and the unstar
+cascade to tags and groups.
+
+## Network tests
+
+Fifteen `wiremock` fixtures in `crates/sync/tests/sync.rs`. They drive the real
+`SyncEngine` through the `GitHub::with_base_url` seam, so nothing is stubbed
+above the socket.
+
+Two patterns worth copying:
+
+- **`Sequence`**, a `wiremock::Respond` impl that scripts per-call bodies, so a
+  test can assert "the second reply differs from the first" without depending on
+  mock ordering. Used in `crates/ai/tests/providers.rs`.
+- **`.expect(1)`** as the assertion itself. `a_not_modified_refresh_costs_nothing`
+  mounts the conditional GET with `.expect(1)` and deliberately leaves page 2
+  unmounted, so requesting it would fail the test.
+
+## Headless GPUI tests
+
+22 tests — 17 in `crates/ui/tests/workspace.rs`, 5 in
+`crates/ui/tests/overlays.rs`. `crates/ui`'s dev-dependencies enable `gpui`'s
+`test-support` feature, which substitutes a headless platform layer. **No window
+opens and no Vulkan device is created**, so they run in CI with no `xvfb` and no
+software renderer.
+
+The recipe:
+
+<Steps>
+  <Step title="Declare the test">
+
+```rust
+#[gpui::test]
+async fn a_thing_happens(cx: &mut TestAppContext) {
+```
+
+  </Step>
+  <Step title="Build a real store and runtime">
+
+A one-worker Tokio runtime and an in-memory store, seeded through the real DAO:
+
+```rust
+let runtime = Arc::new(
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap(),
+);
+let store = runtime.block_on(Store::open_in_memory()).unwrap();
+runtime.block_on(store.upsert_repos(&fixtures())).unwrap();
+```
+
+  </Step>
+  <Step title="Install globals in the same order main.rs does">
+
+```rust
+cx.update(|cx| {
+    gpui_component::init(cx);
+    starlet_ui::init(Appearance::Dark, cx);
+    cx.set_global(Backend::new(store, runtime));
+    cx.set_global(Session::signed_out());
+});
+```
+
+  </Step>
+  <Step title="Open a window wrapped in Root">
+
+`add_window_view` returns the **root**, so capture the inner
+`Entity<SearchView>` through an `Rc<RefCell<Option<_>>>`:
+
+```rust
+cx.add_window_view(|window, cx| {
+    let view = cx.new(|cx| SearchView::new(window, cx));
+    *slot.borrow_mut() = Some(view.clone());
+    Root::new(view, window, cx)
+});
+```
+
+`Root` is not optional — the overlay layers resolve through it.
+
+  </Step>
+  <Step title="Settle both executors">
+
+```rust
+settle(cx);
+```
+
+  </Step>
+  <Step title="Drive and assert">
+
+`cx.simulate_input("…")` and `cx.dispatch_action(SomeAction)` to drive;
+`view.read_with(cx, |v, cx| …)` or `cx.update(|window, cx| …)` for window-level
+predicates such as `has_active_dialog`.
+
+  </Step>
+</Steps>
+
+### Why `run_until_parked` is not enough
+
+GPUI's test executor knows nothing about the Tokio runtime. It parks while a
+Tokio worker is still mid-query, and the assertion then runs against a
+half-updated view. The fix is a loop of `run_until_parked` plus a short real
+sleep (`crates/ui/tests/workspace.rs:111-117`), and `wait_for(cx, "…", pred)` at
+`:120` for anything with a real deadline.
+
+::::danger[This is the single most common way a UI test goes flaky]
+If a test asserts on data that arrives from the store or the network, it must
+`settle` or `wait_for`. A bare `run_until_parked()` will pass locally and fail on
+a loaded CI runner.
+::::
+
+## Performance budgets
+
+```sh
+just bench
+```
+
+Runs both suites in the release profile with `--nocapture`, so the measured
+numbers are printed.
+
+| Suite | Budget | Reference measurement |
+| --- | --- | --- |
+| `crates/core/tests/ranking_performance.rs` | 10 ms median, three cases | 0.9 / 1.1 / 0.1 ms |
+| `crates/store/tests/search_performance.rs` — FTS | 60 ms median of five terms | 3–4 ms |
+| `crates/store/tests/search_performance.rs` — full load | 800 ms | ~75 ms |
+
+The budgets are an order of magnitude above the measurements on purpose. **They
+exist to catch a missing index or an accidental N+1, not to police
+milliseconds** — a shared CI runner passes, while an algorithmic regression still
+fails. `median_ms` takes 20 samples and the middle one, after a warm-up run whose
+result is asserted non-empty so the timing is not measuring an empty loop.
