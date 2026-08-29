@@ -13,6 +13,9 @@ Starlet mirrors your stars into a local database and searches that. The search
 path never touches the network, so results appear in under a millisecond
 whether you are online or not.
 
+**[Developer documentation →][docs]** — architecture, per-crate reference,
+extension guides, query syntax, the SQL schema, and the decision log.
+
 ---
 
 ## What it does
@@ -20,7 +23,7 @@ whether you are online or not.
 **Search.** Fuzzy matching on `owner/name` plus BM25 full-text over
 descriptions, topics, and tags, blended 70/30. `hlxed` finds `helix-editor`;
 `wings` finds `sharkdp/bat`. The ranking is documented in
-[`docs/search.md`](docs/search.md).
+[Ranking][docs-ranking].
 
 **Filter.** Prefixes in the query — `lang:rust`, `tag:cli`, `owner:tokio-rs`,
 `stars:>1000`, `is:archived`, `sort:recent` — and a collapsible sidebar of tag
@@ -152,7 +155,7 @@ those platforms `Ctrl+K` already moves the selection, so the palette takes
 `Ctrl+Shift+P`. The toolbar and the command palette render whichever chord is
 actually bound, read back out of the keymap, so a label can never advertise a
 shortcut this platform does not have. See
-[ADR 11](docs/adr/0011-platform-keybindings.md).
+[ADR 11][adr-11].
 
 The filter sidebar follows the query: it appears with the results and goes away
 at home. Toggling it explicitly pins it for the session.
@@ -202,7 +205,7 @@ Dependencies point downward; nothing below `ui` knows a window exists.
 
 Blocking work runs on a dedicated Tokio runtime and comes back through a
 oneshot channel that GPUI's executor awaits. Nothing blocks a frame.
-See [ADR 5](docs/adr/0005-tokio-runtime-bridge.md).
+See [ADR 5][adr-5].
 
 ## Performance
 
@@ -223,21 +226,22 @@ window paints before either has run. Guarded by
 
 ## Decisions
 
-One ADR per decision that would otherwise need archaeology:
+One ADR per decision that would otherwise need archaeology, published in full in
+the [decision log][docs-adr]:
 
 | | |
 | --- | --- |
-| [1](docs/adr/0001-published-gpui-crates.md) | Published GPUI crates, not a Git revision |
-| [2](docs/adr/0002-reqwest-github-client.md) | A direct `reqwest` GitHub client instead of `octocrab` |
-| [3](docs/adr/0003-two-stage-search.md) | Two-stage search: synchronous fuzzy, asynchronous BM25 |
-| [4](docs/adr/0004-nucleo-matcher-not-injector.md) | `nucleo`'s low-level matcher, not its threaded injector |
-| [5](docs/adr/0005-tokio-runtime-bridge.md) | A separate Tokio runtime bridged to GPUI |
-| [6](docs/adr/0006-sqlite-schema.md) | WAL, an owned FTS5 table, three separate tag sources |
-| [7](docs/adr/0007-github-app-device-flow.md) | GitHub App device flow, token in the OS keychain |
-| [8](docs/adr/0008-incremental-sync.md) | Watermark, count check, lazy contributors |
-| [9](docs/adr/0009-byok-ai.md) | One provider trait, strict JSON, one retry |
-| [10](docs/adr/0010-theme-as-tokens.md) | The palette is a theme file; assets are embedded |
-| [11](docs/adr/0011-platform-keybindings.md) | Diverge the palette shortcut by platform |
+| [1][adr-1] | Published GPUI crates, not a Git revision |
+| [2][adr-2] | A direct `reqwest` GitHub client instead of `octocrab` |
+| [3][adr-3] | Two-stage search: synchronous fuzzy, asynchronous BM25 |
+| [4][adr-4] | `nucleo`'s low-level matcher, not its threaded injector |
+| [5][adr-5] | A separate Tokio runtime bridged to GPUI |
+| [6][adr-6] | WAL, an owned FTS5 table, three separate tag sources |
+| [7][adr-7] | GitHub App device flow, token in the OS keychain |
+| [8][adr-8] | Watermark, count check, lazy contributors |
+| [9][adr-9] | One provider trait, strict JSON, one retry |
+| [10][adr-10] | The palette is a theme file; assets are embedded |
+| [11][adr-11] | Diverge the palette shortcut by platform |
 
 ## Development
 
@@ -270,9 +274,34 @@ they run headless in CI.
 | `ai` | JSON extraction against malformed samples, one `wiremock` suite per provider, batching and cancellation |
 | `ui` | 22 `#[gpui::test]` interaction and overlay tests plus unit tests for formatting, facets, and the palette |
 
+This documentation site is built with [Blume][blume] from the same `docs/`
+directory and published to GitHub Pages by `.github/workflows/docs.yml`:
+
+```sh
+bun install
+bun run dev      # http://localhost:3000, hot reload
+bun run build    # static output into dist/
+```
+
 ## Licence
 
 MIT. Geist and Geist Mono are bundled under the SIL Open Font License; the
 Lucide icons are bundled from `gpui-component` under ISC.
 
 [gpui]: https://www.gpui.rs
+[blume]: https://github.com/haydenbleasel/blume
+
+[docs]: https://prdlk.github.io/starlet
+[docs-ranking]: https://prdlk.github.io/starlet/reference/ranking
+[docs-adr]: https://prdlk.github.io/starlet/adr
+[adr-1]: https://prdlk.github.io/starlet/adr/published-gpui-crates
+[adr-2]: https://prdlk.github.io/starlet/adr/reqwest-github-client
+[adr-3]: https://prdlk.github.io/starlet/adr/two-stage-search
+[adr-4]: https://prdlk.github.io/starlet/adr/nucleo-matcher-not-injector
+[adr-5]: https://prdlk.github.io/starlet/adr/tokio-runtime-bridge
+[adr-6]: https://prdlk.github.io/starlet/adr/sqlite-schema
+[adr-7]: https://prdlk.github.io/starlet/adr/github-app-device-flow
+[adr-8]: https://prdlk.github.io/starlet/adr/incremental-sync
+[adr-9]: https://prdlk.github.io/starlet/adr/byok-ai
+[adr-10]: https://prdlk.github.io/starlet/adr/theme-as-tokens
+[adr-11]: https://prdlk.github.io/starlet/adr/platform-keybindings
