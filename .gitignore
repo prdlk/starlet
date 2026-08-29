@@ -1,5 +1,19 @@
+# Rust
 /target
+
+# Local databases, including the `just demo` scratch database and its sidecars
 *.db
 *.db-shm
 *.db-wal
+
 .DS_Store
+
+# Docs site (Blume). `.blume/` is the generated Astro runtime, `.blume-verify/`
+# its isolated twin used by `blume build --isolated`; both are regenerated on
+# every run and must never be edited or committed. `dist/` is the built site.
+node_modules/
+.blume/
+.blume-verify/
+dist/
+.env
+.env.local

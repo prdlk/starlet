@@ -1,0 +1,15 @@
+{
+  "name": "starlet-docs",
+  "private": true,
+  "description": "Developer documentation for Starlet, built with Blume.",
+  "scripts": {
+    "dev": "blume dev",
+    "build": "blume build",
+    "preview": "blume preview",
+    "check": "blume check",
+    "validate": "blume validate"
+  },
+  "devDependencies": {
+    "blume": "^1.5.3"
+  }
+}
