@@ -1,0 +1,106 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    # The docs are a separate artifact from the binary: a Rust-only commit has
+    # nothing to republish, and a docs-only commit should not rebuild the site
+    # three times over. Keep this list in step with the Blume content root.
+    paths:
+      - "docs/**"
+      - "public/**"
+      - "blume.config.ts"
+      - "package.json"
+      - "bun.lock"
+      - "tsconfig.json"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "docs/**"
+      - "public/**"
+      - "blume.config.ts"
+      - "package.json"
+      - "bun.lock"
+      - "tsconfig.json"
+      - ".github/workflows/docs.yml"
+  # Republish on demand — useful after changing a Pages setting, which does not
+  # touch the repository and so would otherwise never trigger a deploy.
+  workflow_dispatch:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Blume writes `.blume/` next to the config. Point every command at the
+  # isolated runtime so a developer running `blume dev` locally and CI never
+  # contend over the same generated Astro project.
+  BLUME_RUNTIME_DIR: .blume-verify
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `lastModified: true` in blume.config.ts derives each page's date from
+          # git history. A shallow clone has no history, so every page would be
+          # stamped with the tip commit's date.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Type-checks blume.config.ts and any authored .astro page. Cheap, and it
+      # fails on a config typo before the much slower render starts.
+      - name: blume check
+        run: bunx blume check
+
+      # Broken internal links and missing anchors are the failure mode that
+      # survives a green build, so they are a gate rather than a warning.
+      - name: blume validate
+        run: bunx blume validate --strict
+
+      - name: blume build
+        run: bunx blume build
+
+      # `blume audit` reads the rendered HTML in dist/, so it can only run after
+      # the build. Errors fail; advisory warnings are left to the log.
+      - name: blume audit
+        run: bunx blume audit
+
+      - name: Upload Pages artifact
+        # Only the branch build produces something to deploy; a pull request
+        # stops at the checks above.
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    name: deploy
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    # `pages: write` mints the deployment, `id-token: write` signs the artifact
+    # attestation the Pages deploy action requires.
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

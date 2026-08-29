@@ -1,9 +1,10 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # push:
+  # branches: [main]
+  # pull_request:
+  workflow_dispatch:
 
 # A force-push or a new commit on an open PR makes the in-flight run worthless.
 # Cancel it rather than pay for three platforms of cold Rust builds twice.
