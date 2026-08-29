@@ -71,7 +71,12 @@ impl Ranker {
     ///
     /// Candidates that match neither signal are dropped when the query has
     /// text; with no text every repo survives and only the sort key applies.
-    pub fn rank(&mut self, query: &Query, repos: &[Repo], fts: &HashMap<i64, f32>) -> Vec<Scored> {
+    pub fn rank<R: AsRef<Repo>>(
+        &mut self,
+        query: &Query,
+        repos: &[R],
+        fts: &HashMap<i64, f32>,
+    ) -> Vec<Scored> {
         let sort = query.sort.unwrap_or(if query.has_text() {
             SortKey::Relevance
         } else {
@@ -95,7 +100,12 @@ impl Ranker {
         scored
     }
 
-    fn score_text(&mut self, needle: &str, repos: &[Repo], fts: &HashMap<i64, f32>) -> Vec<Scored> {
+    fn score_text<R: AsRef<Repo>>(
+        &mut self,
+        needle: &str,
+        repos: &[R],
+        fts: &HashMap<i64, f32>,
+    ) -> Vec<Scored> {
         let pattern = Pattern::parse(needle, CaseMatching::Smart, Normalization::Smart);
 
         // Pass 1: collect raw signals and their maxima.
@@ -103,7 +113,7 @@ impl Ranker {
         let mut max_fuzzy = 0f32;
         let mut max_fts = 0f32;
 
-        for (ix, repo) in repos.iter().enumerate() {
+        for (ix, repo) in repos.iter().map(AsRef::as_ref).enumerate() {
             self.haystack_buf.clear();
             let haystack = Utf32Str::new(&repo.full_name, &mut self.haystack_buf);
             let fuzzy = pattern.score(haystack, &mut self.matcher);
@@ -141,33 +151,38 @@ impl Ranker {
 
 /// Order `scored` in place. Every branch falls through to the same tie-break so
 /// the list is a total order and never reshuffles between identical renders.
-fn sort_by(scored: &mut [Scored], sort: SortKey, repos: &[Repo]) {
+fn sort_by<R: AsRef<Repo>>(scored: &mut [Scored], sort: SortKey, repos: &[R]) {
     match sort {
         SortKey::Relevance => scored.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| tie_break(&repos[a.ix], &repos[b.ix]))
+                .then_with(|| tie_break(repos[a.ix].as_ref(), repos[b.ix].as_ref()))
         }),
-        SortKey::Stars => scored.sort_by(|a, b| tie_break(&repos[a.ix], &repos[b.ix])),
+        SortKey::Stars => {
+            scored.sort_by(|a, b| tie_break(repos[a.ix].as_ref(), repos[b.ix].as_ref()))
+        }
         SortKey::Name => scored.sort_by(|a, b| {
             repos[a.ix]
+                .as_ref()
                 .full_name
                 .to_lowercase()
-                .cmp(&repos[b.ix].full_name.to_lowercase())
-                .then_with(|| tie_break(&repos[a.ix], &repos[b.ix]))
+                .cmp(&repos[b.ix].as_ref().full_name.to_lowercase())
+                .then_with(|| tie_break(repos[a.ix].as_ref(), repos[b.ix].as_ref()))
         }),
         SortKey::Recent => scored.sort_by(|a, b| {
             repos[b.ix]
+                .as_ref()
                 .last_commit_at
-                .cmp(&repos[a.ix].last_commit_at)
-                .then_with(|| tie_break(&repos[a.ix], &repos[b.ix]))
+                .cmp(&repos[a.ix].as_ref().last_commit_at)
+                .then_with(|| tie_break(repos[a.ix].as_ref(), repos[b.ix].as_ref()))
         }),
         SortKey::Starred => scored.sort_by(|a, b| {
             repos[b.ix]
+                .as_ref()
                 .starred_at
-                .cmp(&repos[a.ix].starred_at)
-                .then_with(|| tie_break(&repos[a.ix], &repos[b.ix]))
+                .cmp(&repos[a.ix].as_ref().starred_at)
+                .then_with(|| tie_break(repos[a.ix].as_ref(), repos[b.ix].as_ref()))
         }),
     }
 }

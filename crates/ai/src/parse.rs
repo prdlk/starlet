@@ -259,7 +259,10 @@ mod tests {
 
     #[test]
     fn parses_a_bare_object() {
-        let out = parse_tags(r#"{"repos":[{"full_name":"a/b","tags":[{"name":"rust","confidence":0.9}]}]}"#).unwrap();
+        let out = parse_tags(
+            r#"{"repos":[{"full_name":"a/b","tags":[{"name":"rust","confidence":0.9}]}]}"#,
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].full_name, "a/b");
         assert_eq!(out[0].tags[0].source, TagSource::Ai);

@@ -21,7 +21,10 @@ fn main() {
          pub static EMBEDDED: &[(&str, &[u8])] = &[\n",
     );
     for (key, path) in &files {
-        out.push_str(&format!("    ({key:?}, include_bytes!({:?})),\n", path.display()));
+        out.push_str(&format!(
+            "    ({key:?}, include_bytes!({:?})),\n",
+            path.display()
+        ));
     }
     out.push_str("];\n");
 
@@ -30,7 +33,9 @@ fn main() {
 }
 
 fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -38,7 +43,8 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
         } else if let Ok(rel) = path.strip_prefix(root) {
             // Forward slashes: these keys are compared against the paths
             // `gpui-component` hard-codes, which are always POSIX-style.
-            let key = rel.components()
+            let key = rel
+                .components()
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");

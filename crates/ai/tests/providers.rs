@@ -94,12 +94,7 @@ async fn bodies(server: &MockServer) -> Vec<Value> {
 #[tokio::test]
 async fn openai_sends_the_documented_request_and_parses_the_reply() {
     let server = MockServer::start().await;
-    mount(
-        &server,
-        "/v1/chat/completions",
-        vec![openai_envelope(GOOD)],
-    )
-    .await;
+    mount(&server, "/v1/chat/completions", vec![openai_envelope(GOOD)]).await;
 
     let provider = OpenAi::new("sk-test-key", "").with_base_url(server.uri());
     assert_eq!(provider.id(), "openai");
@@ -176,8 +171,7 @@ async fn openai_surfaces_an_error_status_without_the_key() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(
-            ResponseTemplate::new(401)
-                .set_body_string(r#"{"error":"bad key sk-test-key"}"#),
+            ResponseTemplate::new(401).set_body_string(r#"{"error":"bad key sk-test-key"}"#),
         )
         .mount(&server)
         .await;

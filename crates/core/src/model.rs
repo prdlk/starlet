@@ -69,6 +69,14 @@ impl Repo {
     }
 }
 
+/// Lets the ranker work over both owned repos and `Arc<Repo>` snapshots
+/// without the caller cloning 5 000 records on every keystroke.
+impl AsRef<Repo> for Repo {
+    fn as_ref(&self) -> &Repo {
+        self
+    }
+}
+
 /// Where a tag came from. `User` tags are authoritative and are never
 /// overwritten by an AI run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

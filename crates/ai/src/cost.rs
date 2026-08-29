@@ -133,8 +133,7 @@ fn tokens(repos: usize) -> (u64, u64) {
 /// Combine the token model with a price table.
 pub(crate) fn estimate(repos: usize, price: Price) -> CostEstimate {
     let (input_tokens, output_tokens) = tokens(repos);
-    let usd = (input_tokens as f64 * price.input_per_m
-        + output_tokens as f64 * price.output_per_m)
+    let usd = (input_tokens as f64 * price.input_per_m + output_tokens as f64 * price.output_per_m)
         / 1_000_000.0;
     CostEstimate {
         input_tokens,

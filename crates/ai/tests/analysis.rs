@@ -104,7 +104,11 @@ fn repos(n: usize) -> Vec<RepoSummary> {
 }
 
 /// Run to completion and collect every event; the channel is closed by then.
-async fn run(stub: &Stub, repos: &[RepoSummary], cancel: Arc<AtomicBool>) -> (Result<()>, Vec<AiEvent>) {
+async fn run(
+    stub: &Stub,
+    repos: &[RepoSummary],
+    cancel: Arc<AtomicBool>,
+) -> (Result<()>, Vec<AiEvent>) {
     run_with_existing(stub, repos, &HashMap::new(), cancel).await
 }
 
@@ -152,9 +156,18 @@ async fn chunks_at_batch_size_and_emits_one_tagged_event_per_batch() {
     assert_eq!(
         progress,
         [
-            &AiEvent::Progress { done: 25, total: 60 },
-            &AiEvent::Progress { done: 50, total: 60 },
-            &AiEvent::Progress { done: 60, total: 60 },
+            &AiEvent::Progress {
+                done: 25,
+                total: 60
+            },
+            &AiEvent::Progress {
+                done: 50,
+                total: 60
+            },
+            &AiEvent::Progress {
+                done: 60,
+                total: 60
+            },
         ]
     );
 
@@ -197,7 +210,10 @@ async fn a_cancel_before_the_first_batch_costs_nothing() {
 
     assert!(matches!(outcome, Err(AiError::Cancelled)));
     assert!(stub.batch_sizes().is_empty());
-    assert_eq!(events, [AiEvent::Started { batches: 1 }, AiEvent::Cancelled]);
+    assert_eq!(
+        events,
+        [AiEvent::Started { batches: 1 }, AiEvent::Cancelled]
+    );
 }
 
 #[tokio::test]
@@ -211,7 +227,11 @@ async fn one_failing_batch_does_not_abort_the_run() {
 
     outcome.expect("a partial run still succeeds");
     assert_eq!(stub.batch_sizes(), [25, 25, 10], "every batch is attempted");
-    assert_eq!(tagged_counts(&events), [25, 10], "the bad batch yields nothing");
+    assert_eq!(
+        tagged_counts(&events),
+        [25, 10],
+        "the bad batch yields nothing"
+    );
 
     let failures: Vec<&AiEvent> = events
         .iter()
@@ -220,7 +240,10 @@ async fn one_failing_batch_does_not_abort_the_run() {
     assert_eq!(failures.len(), 1, "the failure is surfaced, not swallowed");
 
     // Progress still reaches the total so the bar completes.
-    assert!(events.contains(&AiEvent::Progress { done: 60, total: 60 }));
+    assert!(events.contains(&AiEvent::Progress {
+        done: 60,
+        total: 60
+    }));
     assert!(matches!(
         events.last(),
         Some(AiEvent::Finished { repos: 35, .. })
@@ -292,7 +315,10 @@ async fn an_empty_library_finishes_without_calling_the_provider() {
         events,
         [
             AiEvent::Started { batches: 0 },
-            AiEvent::Finished { repos: 0, cost: 0.0 },
+            AiEvent::Finished {
+                repos: 0,
+                cost: 0.0
+            },
         ]
     );
 }

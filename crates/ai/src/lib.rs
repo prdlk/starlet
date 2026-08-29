@@ -25,8 +25,8 @@
 pub mod analysis;
 pub mod anthropic;
 pub mod cost;
-pub mod openai;
 pub mod ollama;
+pub mod openai;
 pub mod parse;
 pub mod prompt;
 pub mod provider;
@@ -36,8 +36,8 @@ mod client;
 pub use analysis::{AiEvent, BATCH_SIZE, analyze};
 pub use anthropic::Anthropic;
 pub use cost::Price;
-pub use openai::OpenAi;
 pub use ollama::Ollama;
+pub use openai::OpenAi;
 pub use parse::{parse_groups, parse_tags};
 pub use provider::{AiError, AiProvider, CostEstimate, RepoTags, RepoWithTags, Result};
 
@@ -70,7 +70,10 @@ mod tests {
         for id in PROVIDER_IDS {
             let provider = provider_for(id, "k", "").expect("listed id must build");
             assert_eq!(provider.id(), id);
-            assert!(!provider.model().is_empty(), "{id} must have a default model");
+            assert!(
+                !provider.model().is_empty(),
+                "{id} must have a default model"
+            );
         }
         assert!(provider_for("gemini", "k", "").is_none());
     }

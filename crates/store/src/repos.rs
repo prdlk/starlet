@@ -368,3 +368,20 @@ impl Store {
         Ok(out)
     }
 }
+
+impl Store {
+    /// Resolve a `owner/name` to its GitHub id.
+    ///
+    /// AI results address repositories by name because that is what the model
+    /// was shown; this is the only place that mapping is needed.
+    pub async fn repo_id_by_full_name(&self, full_name: &str) -> Result<Option<i64>> {
+        let row = sqlx::query("SELECT id FROM repos WHERE full_name = ?")
+            .bind(full_name)
+            .fetch_optional(self.pool())
+            .await?;
+        match row {
+            Some(row) => Ok(Some(row.try_get(0)?)),
+            None => Ok(None),
+        }
+    }
+}

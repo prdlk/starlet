@@ -106,7 +106,10 @@ mod tests {
             (&dark.colors.muted_foreground, "#a1a1aa"),
         ] {
             let parsed = gpui::Hsla::parse_hex(actual.as_ref().expect("colour set")).unwrap();
-            assert_eq!(parsed.to_hex().to_lowercase()[..7], expected[..7].to_lowercase());
+            assert_eq!(
+                parsed.to_hex().to_lowercase()[..7],
+                expected[..7].to_lowercase()
+            );
         }
         assert_eq!(dark.radius, Some(6));
         assert_eq!(dark.shadow, Some(false));

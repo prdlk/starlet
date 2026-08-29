@@ -23,12 +23,20 @@ pub const BATCH_SIZE: usize = 25;
 /// Everything a run reports back, in the order it happens.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AiEvent {
-    Started { batches: usize },
-    Progress { done: usize, total: usize },
+    Started {
+        batches: usize,
+    },
+    Progress {
+        done: usize,
+        total: usize,
+    },
     /// One batch's tags, ready to persist.
     Tagged(Vec<RepoTags>),
     Grouped(Vec<Group>),
-    Finished { repos: usize, cost: f64 },
+    Finished {
+        repos: usize,
+        cost: f64,
+    },
     /// A recoverable failure. The run continues; this is a notification, not a
     /// terminal state.
     Failed(String),
@@ -55,15 +63,21 @@ pub async fn analyze(
 ) -> Result<()> {
     let total = repos.len();
     let batches: Vec<&[RepoSummary]> = repos.chunks(BATCH_SIZE).collect();
-    emit(&events, AiEvent::Started {
-        batches: batches.len(),
-    })?;
+    emit(
+        &events,
+        AiEvent::Started {
+            batches: batches.len(),
+        },
+    )?;
 
     if batches.is_empty() {
-        emit(&events, AiEvent::Finished {
-            repos: 0,
-            cost: 0.0,
-        })?;
+        emit(
+            &events,
+            AiEvent::Finished {
+                repos: 0,
+                cost: 0.0,
+            },
+        )?;
         return Ok(());
     }
 
@@ -105,9 +119,8 @@ pub async fn analyze(
     if failures == batches.len() {
         // Nothing worked. Almost always a bad key, a wrong base URL, or a model
         // that does not exist, so surface the real error rather than a summary.
-        return Err(last_error.unwrap_or_else(|| {
-            AiError::MalformedResponse("every tagging batch failed".into())
-        }));
+        return Err(last_error
+            .unwrap_or_else(|| AiError::MalformedResponse("every tagging batch failed".into())));
     }
 
     if cancelled(&cancel) {
@@ -127,10 +140,13 @@ pub async fn analyze(
         }
     }
 
-    emit(&events, AiEvent::Finished {
-        repos: tagged.len(),
-        cost: provider.estimate(total).usd,
-    })?;
+    emit(
+        &events,
+        AiEvent::Finished {
+            repos: tagged.len(),
+            cost: provider.estimate(total).usd,
+        },
+    )?;
     Ok(())
 }
 

@@ -54,10 +54,7 @@ const MAX_ERROR_BODY: usize = 512;
 ///
 /// The key is scrubbed from the error body because some gateways echo the
 /// `Authorization` header back in their 401 payload.
-pub(crate) async fn body_or_status(
-    response: reqwest::Response,
-    key: &ApiKey,
-) -> Result<String> {
+pub(crate) async fn body_or_status(response: reqwest::Response, key: &ApiKey) -> Result<String> {
     let status = response.status();
     let body = response.text().await?;
     if status.is_success() {
@@ -131,9 +128,7 @@ pub(crate) fn envelope_field(
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
-            AiError::MalformedResponse(format!(
-                "{provider} response has no text at `{pointer}`"
-            ))
+            AiError::MalformedResponse(format!("{provider} response has no text at `{pointer}`"))
         })
 }
 
