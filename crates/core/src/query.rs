@@ -73,7 +73,9 @@ impl Field {
     }
 
     /// The prefixes offered by the command palette and completion hints.
-    pub const ALL: [&'static str; 7] = ["lang:", "tag:", "group:", "owner:", "stars:", "is:", "sort:"];
+    pub const ALL: [&'static str; 7] = [
+        "lang:", "tag:", "group:", "owner:", "stars:", "is:", "sort:",
+    ];
 }
 
 /// An inclusive star-count interval. `None` on a side means unbounded.
@@ -257,27 +259,50 @@ fn unquote(s: &str) -> String {
 fn parse_star_range(value: &str) -> Option<StarRange> {
     let v = value.trim();
     if let Some((lo, hi)) = v.split_once("..") {
-        let min = if lo.is_empty() { None } else { Some(parse_count(lo)?) };
-        let max = if hi.is_empty() { None } else { Some(parse_count(hi)?) };
+        let min = if lo.is_empty() {
+            None
+        } else {
+            Some(parse_count(lo)?)
+        };
+        let max = if hi.is_empty() {
+            None
+        } else {
+            Some(parse_count(hi)?)
+        };
         if min.is_none() && max.is_none() {
             return None;
         }
         return Some(StarRange { min, max });
     }
     if let Some(rest) = v.strip_prefix(">=") {
-        return Some(StarRange { min: Some(parse_count(rest)?), max: None });
+        return Some(StarRange {
+            min: Some(parse_count(rest)?),
+            max: None,
+        });
     }
     if let Some(rest) = v.strip_prefix("<=") {
-        return Some(StarRange { min: None, max: Some(parse_count(rest)?) });
+        return Some(StarRange {
+            min: None,
+            max: Some(parse_count(rest)?),
+        });
     }
     if let Some(rest) = v.strip_prefix('>') {
-        return Some(StarRange { min: Some(parse_count(rest)?.saturating_add(1)), max: None });
+        return Some(StarRange {
+            min: Some(parse_count(rest)?.saturating_add(1)),
+            max: None,
+        });
     }
     if let Some(rest) = v.strip_prefix('<') {
-        return Some(StarRange { min: None, max: Some(parse_count(rest)?.saturating_sub(1)) });
+        return Some(StarRange {
+            min: None,
+            max: Some(parse_count(rest)?.saturating_sub(1)),
+        });
     }
     let n = parse_count(v)?;
-    Some(StarRange { min: Some(n), max: Some(n) })
+    Some(StarRange {
+        min: Some(n),
+        max: Some(n),
+    })
 }
 
 /// A non-negative integer, optionally with a `k` or `m` magnitude suffix.
@@ -364,13 +389,19 @@ mod tests {
     fn recognises_every_prefix() {
         let q = parse("lang:rust tag:cli group:tools owner:helix-editor stars:>1000");
         assert_eq!(
-            q.clauses.iter().map(|c| c.filter.clone()).collect::<Vec<_>>(),
+            q.clauses
+                .iter()
+                .map(|c| c.filter.clone())
+                .collect::<Vec<_>>(),
             vec![
                 Filter::Language("rust".into()),
                 Filter::Tag("cli".into()),
                 Filter::Group("tools".into()),
                 Filter::Owner("helix-editor".into()),
-                Filter::Stars(StarRange { min: Some(1001), max: None }),
+                Filter::Stars(StarRange {
+                    min: Some(1001),
+                    max: None
+                }),
             ]
         );
         assert!(q.terms.is_empty());
@@ -378,7 +409,10 @@ mod tests {
 
     #[test]
     fn language_alias_and_case() {
-        assert_eq!(filters("LANGUAGE:Rust"), vec![Filter::Language("Rust".into())]);
+        assert_eq!(
+            filters("LANGUAGE:Rust"),
+            vec![Filter::Language("Rust".into())]
+        );
         assert_eq!(filters("user:foo"), vec![Filter::Owner("foo".into())]);
     }
 
@@ -386,19 +420,31 @@ mod tests {
     fn star_ranges() {
         assert_eq!(
             filters("stars:>=1k"),
-            vec![Filter::Stars(StarRange { min: Some(1000), max: None })]
+            vec![Filter::Stars(StarRange {
+                min: Some(1000),
+                max: None
+            })]
         );
         assert_eq!(
             filters("stars:<50"),
-            vec![Filter::Stars(StarRange { min: None, max: Some(49) })]
+            vec![Filter::Stars(StarRange {
+                min: None,
+                max: Some(49)
+            })]
         );
         assert_eq!(
             filters("stars:100..500"),
-            vec![Filter::Stars(StarRange { min: Some(100), max: Some(500) })]
+            vec![Filter::Stars(StarRange {
+                min: Some(100),
+                max: Some(500)
+            })]
         );
         assert_eq!(
             filters("stars:1.5k"),
-            vec![Filter::Stars(StarRange { min: Some(1500), max: Some(1500) })]
+            vec![Filter::Stars(StarRange {
+                min: Some(1500),
+                max: Some(1500)
+            })]
         );
     }
 
@@ -441,7 +487,10 @@ mod tests {
     #[test]
     fn quoted_values_keep_spaces() {
         let q = parse("tag:\"machine learning\" hello world");
-        assert_eq!(filters("tag:\"machine learning\""), vec![Filter::Tag("machine learning".into())]);
+        assert_eq!(
+            filters("tag:\"machine learning\""),
+            vec![Filter::Tag("machine learning".into())]
+        );
         assert_eq!(q.terms, ["hello", "world"]);
     }
 

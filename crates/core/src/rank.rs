@@ -82,7 +82,12 @@ impl Ranker {
             self.score_text(&query.text, repos, fts)
         } else {
             (0..repos.len())
-                .map(|ix| Scored { ix, score: 0.0, fuzzy: 0.0, fts: 0.0 })
+                .map(|ix| Scored {
+                    ix,
+                    score: 0.0,
+                    fuzzy: 0.0,
+                    fts: 0.0,
+                })
                 .collect()
         };
 
@@ -117,7 +122,11 @@ impl Ranker {
         // Pass 2: normalise into 0..=1 and combine.
         raw.into_iter()
             .map(|(ix, fuzzy, text)| {
-                let f = if max_fuzzy > 0.0 { fuzzy / max_fuzzy } else { 0.0 };
+                let f = if max_fuzzy > 0.0 {
+                    fuzzy / max_fuzzy
+                } else {
+                    0.0
+                };
                 let t = if max_fts > 0.0 { text / max_fts } else { 0.0 };
                 Scored {
                     ix,
@@ -201,7 +210,10 @@ mod tests {
     }
 
     fn names(scored: &[Scored], repos: &[Repo]) -> Vec<String> {
-        scored.iter().map(|s| repos[s.ix].full_name.clone()).collect()
+        scored
+            .iter()
+            .map(|s| repos[s.ix].full_name.clone())
+            .collect()
     }
 
     #[test]

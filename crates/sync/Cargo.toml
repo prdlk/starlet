@@ -1,0 +1,29 @@
+[package]
+name = "starlet-sync"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "starlet_sync"
+path = "src/lib.rs"
+
+[dependencies]
+starlet-core.workspace = true
+starlet-store.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+wiremock.workspace = true
