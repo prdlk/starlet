@@ -1,0 +1,25 @@
+[package]
+name = "starlet-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "starlet_ai"
+path = "src/lib.rs"
+
+[dependencies]
+starlet-core.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
