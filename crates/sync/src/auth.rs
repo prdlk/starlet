@@ -28,10 +28,10 @@ const ACCESS_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 /// environment override so a user can point a self-registered App at their own
 /// build without recompiling. See the README for registration steps.
 pub fn client_id() -> Option<String> {
-    if let Ok(id) = std::env::var("STARLET_GITHUB_CLIENT_ID") {
-        if !id.trim().is_empty() {
-            return Some(id);
-        }
+    if let Ok(id) = std::env::var("STARLET_GITHUB_CLIENT_ID")
+        && !id.trim().is_empty()
+    {
+        return Some(id);
     }
     option_env!("STARLET_GITHUB_CLIENT_ID")
         .map(str::trim)

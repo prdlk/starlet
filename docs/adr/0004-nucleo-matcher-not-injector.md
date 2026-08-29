@@ -1,0 +1,33 @@
+# 4. Use nucleo's low-level matcher, not its threaded injector
+
+Status: accepted
+
+## Context
+
+`nucleo` exposes two layers. The high-level `Nucleo<T>` owns a worker pool and
+an `Injector`; the caller pushes items in, calls `tick()` on a timer, and reads
+a snapshot. The low-level `nucleo::Matcher` plus `pattern::Pattern` is a
+synchronous scoring function.
+
+The obvious reading of "load all repos into a nucleo injector at startup" is
+the high-level API.
+
+## Decision
+
+Use the low-level `Matcher`. `starlet_core::rank::Ranker` owns one `Matcher`
+and its scratch buffer for the lifetime of the search view and scores the
+candidate slice synchronously.
+
+## Consequences
+
+* No tick loop, no redraw callback, no snapshot staleness. A keystroke produces
+  its results inside the same call.
+* Measured 0.9 ms for the worst case — a one-character query where almost
+  every repository matches and the whole corpus is scored and sorted. The
+  threaded machinery would add coordination overhead to solve a problem this
+  corpus does not have.
+* Ranking is a pure function, so it is unit-tested against a fixed corpus with
+  an expected order, and a performance test guards the budget.
+* If a user ever has hundreds of thousands of stars this becomes the wrong
+  choice. `Ranker` is the only thing that would change; it is generic over
+  `AsRef<Repo>` and has no callers outside the search view.

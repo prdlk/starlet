@@ -321,12 +321,10 @@ fn build_provider(
     let provider = starlet_ai::provider_for(id, key, model)?;
     // Only Ollama has a user-configurable origin; the hosted providers keep
     // their published endpoints so a typo cannot silently exfiltrate a key.
-    if local {
-        if let Some(endpoint) = endpoint.map(str::trim).filter(|e| !e.is_empty()) {
-            return Some(Box::new(
-                starlet_ai::Ollama::new("", provider.model().to_string()).with_base_url(endpoint),
-            ));
-        }
+    if local && let Some(endpoint) = endpoint.map(str::trim).filter(|e| !e.is_empty()) {
+        return Some(Box::new(
+            starlet_ai::Ollama::new("", provider.model().to_string()).with_base_url(endpoint),
+        ));
     }
     Some(provider)
 }

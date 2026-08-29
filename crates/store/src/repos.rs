@@ -10,7 +10,12 @@ use crate::time::{format_ts, parse_ts};
 use crate::{Result, Store, StoreError};
 
 /// The `repos` row exactly as SQLite stores it.
-#[derive(Debug, sqlx::FromRow)]
+///
+/// Decoded positionally rather than through `#[derive(FromRow)]`: the derive
+/// looks every column up by name, which at eighteen columns and five thousand
+/// rows costs more than the query itself. `REPO_COLUMNS` is the single
+/// definition of that order.
+#[derive(Debug)]
 struct RepoRow {
     id: i64,
     node_id: String,
@@ -32,6 +37,31 @@ struct RepoRow {
     synced_at: Option<String>,
 }
 
+impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for RepoRow {
+    fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> sqlx::Result<Self> {
+        Ok(Self {
+            id: row.try_get(0)?,
+            node_id: row.try_get(1)?,
+            full_name: row.try_get(2)?,
+            name: row.try_get(3)?,
+            owner: row.try_get(4)?,
+            html_url: row.try_get(5)?,
+            description: row.try_get(6)?,
+            stargazers: row.try_get(7)?,
+            last_commit_at: row.try_get(8)?,
+            primary_language: row.try_get(9)?,
+            languages_json: row.try_get(10)?,
+            contributors_json: row.try_get(11)?,
+            starred_at: row.try_get(12)?,
+            archived: row.try_get(13)?,
+            fork: row.try_get(14)?,
+            topics_json: row.try_get(15)?,
+            updated_at: row.try_get(16)?,
+            synced_at: row.try_get(17)?,
+        })
+    }
+}
+
 const REPO_COLUMNS: &str = "id, node_id, full_name, name, owner, html_url, description, \
      stargazers, last_commit_at, primary_language, languages_json, contributors_json, \
      starred_at, archived, fork, topics_json, updated_at, synced_at";
@@ -40,16 +70,25 @@ impl RepoRow {
     /// `with_contributors` is false on the list path: 5 000 contributor arrays
     /// are ~10 MB of JSON nobody is looking at until a sheet opens.
     fn into_repo(self, with_contributors: bool) -> Result<Repo> {
-        let languages: LanguageBytes =
+        // Most repositories have no language breakdown until the GraphQL
+        // backfill runs, and plenty have no topics; skipping the parse for the
+        // schema defaults removes two allocations per row.
+        let languages: LanguageBytes = if self.languages_json == "{}" {
+            LanguageBytes::new()
+        } else {
             serde_json::from_str(&self.languages_json).map_err(|source| StoreError::Json {
                 column: "languages_json",
                 source,
-            })?;
-        let topics: Vec<String> =
+            })?
+        };
+        let topics: Vec<String> = if self.topics_json == "[]" {
+            Vec::new()
+        } else {
             serde_json::from_str(&self.topics_json).map_err(|source| StoreError::Json {
                 column: "topics_json",
                 source,
-            })?;
+            })?
+        };
         let contributors = match (with_contributors, self.contributors_json.as_deref()) {
             (true, Some(raw)) => serde_json::from_str(raw).map_err(|source| StoreError::Json {
                 column: "contributors_json",

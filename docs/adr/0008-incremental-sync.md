@@ -1,0 +1,46 @@
+# 8. Incremental sync: a watermark, a count check, and lazy contributors
+
+Status: accepted
+
+## Context
+
+The star listing is newest-first, so an incremental run can stop at the first
+star it already knows. Unstars leave no trace in that listing — the only way to
+find them is to compare the full remote set against the local one, which for
+5 000 stars is fifty requests. Doing that every fifteen minutes is wasteful.
+
+Separately, GitHub's GraphQL schema has **no contributors connection**.
+Contributors are REST-only, one request per repository. Fetching them during
+sync would cost one request per starred repository per run.
+
+## Decision
+
+**Watermark for additions.** Page until the first star older than the stored
+watermark, then stop.
+
+**A count check for removals.** `viewer { starredRepositories { totalCount } }`
+costs one GraphQL point. When it disagrees with the local row count, and only
+then, escalate to a full listing pass and diff the id sets.
+
+**Languages in GraphQL batches, contributors lazily over REST.** Twenty-five
+aliased `repository` fields per document backfills languages cheaply during
+sync. Contributors are fetched when a detail sheet opens and cached in the
+repository row.
+
+**Conditional metadata refresh.** Repositories whose `synced_at` is older than
+24 hours are re-fetched with `If-None-Match`, at most 250 per run. A `304`
+touches `synced_at` and costs no rate-limit budget.
+
+## Consequences
+
+* A steady-state incremental run is one starred page, one GraphQL count, and
+  some 304s.
+* An unstar is noticed on the next run after the count diverges, not instantly.
+  Starring and unstarring the same repository between two runs is invisible,
+  which is correct — nothing changed.
+* A metadata refresh explicitly preserves `starred_at`, because the repository
+  endpoint does not return it and overwriting it with `None` would destroy the
+  default browse ordering. This is covered by a fixture test.
+* A `404` during refresh touches `synced_at` and leaves the row alone. The
+  repository may have gone private temporarily; deleting local data on a
+  transient error is worse than showing a stale row until the next full sync.

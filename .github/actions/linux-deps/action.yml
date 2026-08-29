@@ -1,0 +1,43 @@
+name: Install Linux native dependencies
+description: >-
+  Installs the system libraries the Starlet workspace links against on Linux.
+  Extracted into a composite action so the lint and test jobs cannot drift apart
+  on the package list.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          build-essential \
+          pkg-config \
+          cmake \
+          clang \
+          libclang-dev \
+          libvulkan-dev \
+          libxkbcommon-dev \
+          libxkbcommon-x11-dev \
+          libwayland-dev \
+          libx11-dev \
+          libxcb1-dev \
+          libfontconfig1-dev \
+          libdbus-1-dev
+        # Why each of these is here (Cargo.lock is the source of truth):
+        #   clang/libclang-dev  - bindgen (transitive) needs libclang at build time.
+        #   cmake/build-essential - `cc`-driven C builds, notably the bundled SQLite
+        #                         amalgamation from libsqlite3-sys.
+        #   libvulkan-dev       - `ash`/blade-graphics is GPUI's Linux rendering
+        #                         backend; provides the loader and headers.
+        #   libxkbcommon*-dev   - the `xkbcommon` crate links these, not dlopens them.
+        #   libwayland-dev,
+        #   libx11-dev,
+        #   libxcb1-dev         - GPUI compiles both its Wayland and X11 backends.
+        #   libfontconfig1-dev  - yeslogic-fontconfig-sys links libfontconfig.
+        #   libdbus-1-dev       - keyring's `sync-secret-service` backend resolves to
+        #                         dbus-secret-service -> libdbus-sys via pkg-config.
+        # Deliberately absent: libssl-dev. reqwest is configured with rustls-tls and
+        # default-features off, and no openssl-sys appears in Cargo.lock.
+        # Also absent: mesa-vulkan-drivers. No test opens a real Vulkan device.

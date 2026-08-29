@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
     let count: usize = args.next().and_then(|n| n.parse().ok()).unwrap_or(5_000);
 
     let store = Store::open(&path).await?;
-    let mut rng = Rng(0x5EED_57A2_1E7);
+    let mut rng = Rng(0x05EE_D57A_21E7);
     let now = Utc::now();
 
     let mut repos = Vec::with_capacity(count);

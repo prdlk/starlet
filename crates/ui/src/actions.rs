@@ -35,6 +35,8 @@ actions!(
         SyncNow,
         Analyze,
         SignOut,
+        /// Move focus between the search input and the results table.
+        CycleFocus,
     ]
 );
 
@@ -74,6 +76,22 @@ pub fn bind_keys(cx: &mut App) {
         // detail shortcut only exists where the table owns the keyboard.
         KeyBinding::new("space", ShowDetail, Some(RESULTS_CONTEXT)),
         KeyBinding::new("enter", OpenInBrowser, Some(RESULTS_CONTEXT)),
+        // These four are registered inside `Input` as well as on the workspace.
+        // The component binds them itself, and a binding on an ancestor context
+        // never wins against one on the focused node, so the only way to give
+        // them product meaning is to re-register them here. Registration order
+        // decides the winner and `gpui_component::init` has already run.
+        //
+        // This is safe because Starlet has no multi-line text entry: nothing
+        // needs Tab to indent, Ctrl+J/K to move a caret between lines, or
+        // Cmd+C to copy a query the user just typed. The object every one of
+        // these commands acts on is the highlighted repository.
+        KeyBinding::new("tab", CycleFocus, Some("Input")),
+        KeyBinding::new("up", SelectPrev, Some("Input")),
+        KeyBinding::new("down", SelectNext, Some("Input")),
+        KeyBinding::new("secondary-c", CopyUrl, Some("Input")),
+        KeyBinding::new("tab", CycleFocus, Some(CONTEXT)),
+        KeyBinding::new("tab", CycleFocus, Some(RESULTS_CONTEXT)),
         KeyBinding::new("up", SelectPrev, Some(RESULTS_CONTEXT)),
         KeyBinding::new("down", SelectNext, Some(RESULTS_CONTEXT)),
     ]);
@@ -86,5 +104,17 @@ pub const fn command_palette_shortcut() -> &'static str {
         "⌘K"
     } else {
         "⌃⇧P"
+    }
+}
+
+/// Render a `secondary-`prefixed chord the way this platform writes it.
+///
+/// The keymap uses one binding for both platforms; the label must not, or a
+/// Linux user reads `⌘R` for a shortcut that is actually Ctrl+R.
+pub fn secondary_shortcut(key: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("⌘{}", key.to_uppercase())
+    } else {
+        format!("Ctrl+{}", key.to_uppercase())
     }
 }

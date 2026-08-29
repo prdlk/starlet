@@ -1,0 +1,34 @@
+# 5. A separate Tokio runtime, bridged to GPUI by oneshot channels
+
+Status: accepted
+
+## Context
+
+`sqlx` and `reqwest` require a Tokio reactor. GPUI runs its own executor on the
+platform main loop and has no Tokio compatibility layer. Pretending one can
+host the other leads to a `Handle::block_on` somewhere in a render path.
+
+## Decision
+
+The application owns one multi-threaded Tokio runtime with two worker threads,
+stored in the `Backend` global alongside the `Store`. `Backend::spawn` runs a
+future on that runtime and returns a `tokio::sync::oneshot::Receiver`; the
+GPUI side awaits the receiver inside `cx.spawn` and applies the result through
+the entity context.
+
+`Backend::spawn_blocking` covers the keychain, whose platform APIs are
+synchronous.
+
+## Consequences
+
+* Blocking work never touches the frame. The window paints before the first
+  database read completes.
+* Dropping the receiver detaches the work rather than cancelling it. That is
+  the correct default for writes: closing a sheet must not roll back a tag
+  edit. Where cancellation *is* wanted — the AI run — it is explicit, via an
+  `AtomicBool` the orchestrator checks between batches.
+* Two globals exist, `Backend` and `Session`. Everything else in the interface
+  is an `Entity<T>` owned by the view that needs it.
+* GPUI's test executor knows nothing about the Tokio runtime, so the interaction
+  tests park both: `run_until_parked` in a loop with a short real sleep, wrapped
+  in a `wait_for` helper with a timeout.

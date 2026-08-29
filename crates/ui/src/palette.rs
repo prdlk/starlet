@@ -60,11 +60,12 @@ impl Command {
     }
 
     fn hint(&self) -> Option<SharedString> {
+        use crate::actions::secondary_shortcut;
         match self {
             Command::Filter { query, .. } => Some(SharedString::from(*query)),
-            Command::Sync => Some("⌘R".into()),
-            Command::Settings => Some("⌘,".into()),
-            Command::ToggleSidebar => Some("⌘B".into()),
+            Command::Sync => Some(secondary_shortcut("r").into()),
+            Command::Settings => Some(secondary_shortcut(",").into()),
+            Command::ToggleSidebar => Some(secondary_shortcut("b").into()),
             _ => None,
         }
     }

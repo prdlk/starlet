@@ -1,0 +1,32 @@
+# 11. Diverge the command palette shortcut by platform
+
+Status: accepted
+
+## Context
+
+The intended keymap has `Cmd+K` for the command palette and `Ctrl+J` / `Ctrl+K`
+for selection movement. On macOS those are distinct keys. GPUI's `secondary-`
+modifier is Cmd on macOS and **Ctrl** elsewhere, so on Linux and Windows
+`secondary-k` and `ctrl-k` are the same chord, and the later registration
+silently wins.
+
+Selection movement is used constantly; the palette is used occasionally and has
+a visible toolbar button. Losing either binding to a silent collision is worse
+than diverging.
+
+## Decision
+
+`Cmd+K` opens the palette on macOS. Elsewhere it is `Ctrl+Shift+P`, the
+familiar chord on those platforms. `Ctrl+J` and `Ctrl+K` move the selection
+everywhere. The toolbar button renders whichever shortcut is actually bound, from
+a single `command_palette_shortcut()` function, so the label cannot drift from
+the binding.
+
+## Consequences
+
+* No shortcut is shadowed, and the interface never advertises a chord that does
+  nothing.
+* The keyboard table in the README documents both.
+* A related decision: `Space` opens the detail sheet only when the results table
+  owns the keyboard, because while the search input has focus `Space` is a
+  literal character. `Tab` moves focus between the input and the table.

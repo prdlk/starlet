@@ -1,0 +1,40 @@
+# 1. Depend on published GPUI crates, not a Git revision
+
+Status: accepted
+
+## Context
+
+GPUI is pre-1.0 and most projects that use it pin a Zed Git revision. Two
+options were available:
+
+* `gpui` and `gpui-component` from crates.io (`0.2.2` and `0.5.1`);
+* a Git revision of Zed plus a Git revision of `gpui-component` from its
+  `main` branch.
+
+The published `gpui-component 0.5.1` is roughly seven months older than its
+`main` branch. `main` has since split reusable behaviour into a separate
+`gpui-base` crate, which the project's own documentation site now describes.
+So the published crate and the published documentation disagree.
+
+## Decision
+
+Depend on the published crates and treat the **vendored crate source** as the
+API authority, not the documentation site.
+
+The source for both crates was downloaded and read directly while writing every
+view. Where the site described a `gpui-base` primitive that does not exist in
+`0.5.1`, the `0.5.1` equivalent was used.
+
+## Consequences
+
+* `Cargo.lock` is committed and CI runs `--locked`, so a build is reproducible
+  from a checkout with no network dependency on a Git host or a moving branch.
+* Starlet does not get `gpui-base` or anything else landed on `main` since
+  February. Nothing needed for this product is missing from `0.5.1`: `Table`
+  with a delegate, `Sheet`, `Dialog`, `Sidebar`, `List` with search, `Input`,
+  `Select`, and the JSON theme system are all present.
+* Upgrading is a deliberate, isolated change: bump one version, compile the
+  owning crate, run the `#[gpui::test]` suite, relaunch. Not a `cargo update`
+  side effect.
+* The published `gpui-component` crate does **not** ship its icon SVGs. The
+  application must supply them through its own `AssetSource`; see ADR 10.

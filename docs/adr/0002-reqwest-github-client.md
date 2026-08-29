@@ -1,0 +1,43 @@
+# 2. A direct reqwest GitHub client instead of octocrab
+
+Status: accepted
+
+## Context
+
+`octocrab` is the usual choice for GitHub in Rust. Starlet's sync engine needs
+four things from the API layer:
+
+1. `GET /user/starred` with `Accept: application/vnd.github.star+json`, the
+   media type that attaches `starred_at` to each repository;
+2. conditional `GET /repos/{owner}/{name}` with `If-None-Match`, because a
+   `304` costs nothing against the rate limit and that is what makes the 24-hour
+   metadata refresh affordable for thousands of repositories;
+3. rate-limit accounting from the response headers, so a long first sync sleeps
+   instead of failing;
+4. one GraphQL document per twenty-five repositories for the language
+   backfill.
+
+Every one of those is a header-level or transport-level concern. Wrapping them
+in a client that abstracts the transport means fighting the abstraction at each
+point.
+
+## Decision
+
+Write a small typed client on `reqwest` in `starlet-sync::client`, roughly 350
+lines including the wire types.
+
+## Consequences
+
+* The `Accept` header is a required parameter of the internal `request`
+  helper rather than a default that call sites override. This caught a real
+  bug: `reqwest`'s `RequestBuilder::header` *appends*, so setting `Accept`
+  twice would have sent two media types and GitHub would have answered with the
+  plain repository representation — silently dropping `starred_at`, the field
+  the whole star listing exists to obtain.
+* Rate limiting, pagination via the `Link` header, and conditional requests are
+  visible in one file instead of distributed across a dependency's opinions.
+* The client takes a base URL, which is what makes the `wiremock` fixture suite
+  possible. Fifteen integration tests drive the real engine against recorded
+  responses.
+* Starlet does not get octocrab's coverage of the rest of the API. It needs six
+  endpoints and uses six endpoints.

@@ -26,7 +26,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Icon, IconName, Root, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
@@ -40,9 +40,9 @@ use starlet_store::{KEY_COLUMN_WIDTHS, Store};
 use starlet_sync::{SyncEngine, SyncEvent, SyncMode, SyncPhase};
 
 use crate::actions::{
-    self, Analyze, CopyUrl, Dismiss, FocusSearch, OpenInBrowser, OpenSettings, SelectFirst,
-    SelectLast, SelectNext, SelectPrev, ShowDetail, SignOut, SyncNow, ToggleCommandPalette,
-    ToggleSidebar,
+    self, Analyze, CopyUrl, CycleFocus, Dismiss, FocusSearch, OpenInBrowser, OpenSettings,
+    SelectFirst, SelectLast, SelectNext, SelectPrev, ShowDetail, SignOut, SyncNow,
+    ToggleCommandPalette, ToggleSidebar,
 };
 use crate::detail::DetailSheet;
 use crate::filters::{FacetFilters, FilterPanel};
@@ -120,7 +120,7 @@ impl SearchView {
                 .col_movable(false)
                 .loop_selection(false)
         });
-        let filters = cx.new(|cx| FilterPanel::new(cx));
+        let filters = cx.new(FilterPanel::new);
 
         let mut subscriptions = vec![
             cx.subscribe_in(&input, window, Self::on_input_event),
@@ -611,6 +611,26 @@ impl SearchView {
 
     // --------------------------------------------------------------- actions
 
+    /// Tab moves between the query and the results.
+    ///
+    /// Focus is what decides whether Space types a character or opens the
+    /// detail sheet, so this is the only way to reach that command from the
+    /// keyboard.
+    fn cycle_focus(&mut self, _: &CycleFocus, window: &mut Window, cx: &mut Context<Self>) {
+        let table = self.table.focus_handle(cx);
+        let input = self.input.focus_handle(cx);
+        if table.contains_focused(window, cx) {
+            window.focus(&input);
+        } else if self.result_count(cx) > 0 {
+            window.focus(&table);
+        }
+    }
+
+    /// True while the results table owns the keyboard.
+    pub fn is_table_focused(&self, window: &Window, cx: &App) -> bool {
+        self.table.focus_handle(cx).contains_focused(window, cx)
+    }
+
     fn focus_search(&mut self, _: &FocusSearch, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |state, cx| state.focus(window, cx));
     }
@@ -856,12 +876,19 @@ impl SearchView {
             .gap_0()
             .when(self.sidebar_open, |this| this.child(self.filters.clone()))
             .child(
-                div().flex_1().min_w_0().size_full().child(
-                    Table::new(&self.table)
-                        .small()
-                        .bordered(false)
-                        .stripe(false),
-                ),
+                div()
+                    // Space and Enter mean something different here than they
+                    // do in the query field, so the table owns its own context.
+                    .key_context(actions::RESULTS_CONTEXT)
+                    .flex_1()
+                    .min_w_0()
+                    .size_full()
+                    .child(
+                        Table::new(&self.table)
+                            .small()
+                            .bordered(false)
+                            .stripe(false),
+                    ),
             )
     }
 }
@@ -878,7 +905,7 @@ pub struct RepoDataChanged;
 impl EventEmitter<RepoDataChanged> for SearchView {}
 
 impl Render for SearchView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let home = self.is_home();
         let target_grow = if home { 1.0 } else { 0.0 };
         let from = self.hero_grow_from;
@@ -889,6 +916,7 @@ impl Render for SearchView {
             .key_context(actions::CONTEXT)
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::focus_search))
+            .on_action(cx.listener(Self::cycle_focus))
             .on_action(cx.listener(Self::dismiss))
             .on_action(cx.listener(Self::toggle_sidebar))
             .on_action(cx.listener(Self::toggle_palette))
@@ -947,5 +975,12 @@ impl Render for SearchView {
                         this.child(div().w_full().flex_grow().flex_shrink())
                     }),
             )
+            // `Root` renders only its child view; the overlay layers are static
+            // helpers the application root has to compose itself. Order is
+            // stacking order: a dialog sits above a sheet, and a notification
+            // above both.
+            .children(Root::render_sheet_layer(window, cx))
+            .children(Root::render_dialog_layer(window, cx))
+            .children(Root::render_notification_layer(window, cx))
     }
 }

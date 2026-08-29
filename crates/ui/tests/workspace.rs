@@ -304,6 +304,54 @@ async fn copying_writes_the_highlighted_repository_url(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn tab_hands_the_keyboard_to_the_table_and_back(cx: &mut TestAppContext) {
+    let (view, cx) = boot(cx);
+    wait_for(cx, "the store to load", |cx| {
+        view.read_with(cx, |v, _| !v.repos().is_empty())
+    });
+
+    cx.simulate_input("editor");
+    settle(cx);
+    assert!(
+        !cx.update(|window, cx| view.read(cx).is_table_focused(window, cx)),
+        "typing leaves focus in the query"
+    );
+
+    cx.dispatch_action(starlet_ui::actions::CycleFocus);
+    settle(cx);
+    assert!(
+        cx.update(|window, cx| view.read(cx).is_table_focused(window, cx)),
+        "Tab moves focus to the results, which is what makes Space mean 'open the sheet'"
+    );
+
+    cx.dispatch_action(starlet_ui::actions::CycleFocus);
+    settle(cx);
+    assert!(
+        !cx.update(|window, cx| view.read(cx).is_table_focused(window, cx)),
+        "Tab again returns to the query"
+    );
+}
+
+#[gpui::test]
+async fn tab_does_nothing_when_there_is_nothing_to_focus(cx: &mut TestAppContext) {
+    let (view, cx) = boot(cx);
+    wait_for(cx, "the store to load", |cx| {
+        view.read_with(cx, |v, _| !v.repos().is_empty())
+    });
+
+    cx.simulate_input("no-such-repository-anywhere");
+    settle(cx);
+    assert_eq!(view.read_with(cx, |v, cx| v.result_count(cx)), 0);
+
+    cx.dispatch_action(starlet_ui::actions::CycleFocus);
+    settle(cx);
+    assert!(
+        !cx.update(|window, cx| view.read(cx).is_table_focused(window, cx)),
+        "focus must not move into an empty table"
+    );
+}
+
+#[gpui::test]
 async fn the_sidebar_toggles(cx: &mut TestAppContext) {
     let (view, cx) = boot(cx);
     cx.dispatch_action(starlet_ui::actions::ToggleSidebar);

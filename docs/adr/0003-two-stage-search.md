@@ -1,0 +1,40 @@
+# 3. Two-stage search: synchronous fuzzy, asynchronous BM25
+
+Status: accepted
+
+## Context
+
+The product requires results under 10 ms per keystroke with no network access,
+and the ranking formula blends a fuzzy score over `owner/name` with an FTS5
+BM25 score over description, topics, and tags.
+
+The fuzzy half is a pure function of data already in memory. The BM25 half
+requires a SQLite query, and `sqlx` is async-only. GPUI renders on the platform
+main loop. Three options:
+
+1. block the render thread on the database query;
+2. hold a second, synchronous SQLite connection and query it inside `render`;
+3. rank with fuzzy alone on the keystroke, then re-rank when BM25 answers.
+
+## Decision
+
+Option 3. Stage one is synchronous and paints the frame; stage two runs on the
+I/O runtime and re-ranks when it lands.
+
+Every query carries a revision counter. A stage-two result whose revision no
+longer matches the current query is discarded, so a slow answer can never
+overwrite a newer search.
+
+## Consequences
+
+* No filesystem or database work happens on the application thread, which is
+  the rule that keeps frame time predictable regardless of corpus size.
+* A description-only match appears one to two frames after a name match would
+  have. Measured: fuzzy rank over 5 000 repositories is 0.9 ms; the FTS query
+  is 3–4 ms.
+* Re-ranking preserves the highlighted repository by identity rather than by
+  row index, so the selection does not slide down the list when stage two
+  reorders. A *new* query resets the highlight to the top instead, because
+  carrying a stale selection through a changing result set is disorienting.
+* The behaviour is tested deterministically: `a_description_only_match_is_found_through_the_full_text_index`
+  drives the real view and waits for stage two.
