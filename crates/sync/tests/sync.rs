@@ -275,6 +275,37 @@ async fn incremental_sync_stops_at_the_watermark() {
 }
 
 #[tokio::test]
+async fn incremental_sync_stops_at_a_missing_star_timestamp() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user/starred"))
+        .and(query_param("page", "1"))
+        .respond_with(headers(ResponseTemplate::new(200).set_body_json(json!([
+            starred(10, "new/one", 10, "2026-03-02T00:00:00Z"),
+            starred(11, "missing/timestamp", 20, "not-a-timestamp"),
+            starred(12, "new/two", 30, "2026-03-01T00:00:00Z"),
+        ]))))
+        .mount(&server)
+        .await;
+    mount_graphql(&server, 1).await;
+
+    let (engine, store) = engine(&server).await;
+    store
+        .set_state(starlet_store::KEY_STAR_WATERMARK, "2026-02-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let (tx, _rx) = unbounded_channel();
+    let summary = engine.run(SyncMode::Incremental, &tx).await.unwrap();
+
+    assert_eq!(
+        summary.seen, 1,
+        "an invalid timestamp ends the incremental scan"
+    );
+    assert_eq!(store.repo_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
 async fn incremental_sync_without_a_watermark_falls_back_to_full() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
