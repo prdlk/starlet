@@ -233,7 +233,7 @@ impl SyncEngine {
                 .items
                 .iter()
                 .take_while(|item| {
-                    parse_ts(item.starred_at.as_deref()).is_none_or(|at| at > watermark)
+                    parse_ts(item.starred_at.as_deref()).is_some_and(|at| at > watermark)
                 })
                 .cloned()
                 .collect();
