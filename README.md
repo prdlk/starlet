@@ -13,6 +13,21 @@ Starlet mirrors your stars into a local database and searches that. The search
 path never touches the network, so results appear in under a millisecond
 whether you are online or not.
 
+<p align="center">
+  <img alt="Starlet showing results for the query “react”: a dense table of owner/name, description, language, stars, last commit, and tags, with a sidebar of group and tag facets" src="docs/assets/screenshot-results.png" width="960">
+</p>
+
+<table align="center">
+  <tr>
+    <td align="center"><img alt="Signed out: the Starlet mark, one Sign in with GitHub button, and a Search offline link" src="docs/assets/screenshot-welcome.png" width="470"></td>
+    <td align="center"><img alt="Signed in, empty query: a single search field centred on a dark canvas" src="docs/assets/screenshot-home.png" width="470"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Signed out — one button.</sub></td>
+    <td align="center"><sub>Home — one input. Type and the results are already there.</sub></td>
+  </tr>
+</table>
+
 **[Developer documentation →][docs]** — architecture, per-crate reference,
 extension guides, query syntax, the SQL schema, and the decision log.
 
