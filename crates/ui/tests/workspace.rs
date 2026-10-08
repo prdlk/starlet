@@ -200,6 +200,33 @@ async fn signing_in_replaces_the_welcome_screen(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn signing_in_starts_the_first_sync(cx: &mut TestAppContext) {
+    let (view, cx) = boot_signed_out(cx);
+    assert_eq!(
+        view.read_with(cx, |v, _| v.sync_status().clone()),
+        starlet_ui::search::SyncStatus::Idle
+    );
+
+    // A closed local port: the sync starts, then fails without the network.
+    let github = starlet_sync::GitHub::new("t")
+        .expect("client")
+        .with_base_url("http://127.0.0.1:9");
+    cx.update(|_, cx| {
+        cx.set_global(Session {
+            status: starlet_ui::AuthStatus::SignedIn,
+            github: Some(github),
+            viewer: None,
+        })
+    });
+    settle(cx);
+    // Before the fix nothing started a sync until the 15-minute tick.
+    assert_ne!(
+        view.read_with(cx, |v, _| v.sync_status().clone()),
+        starlet_ui::search::SyncStatus::Idle
+    );
+}
+
+#[gpui::test]
 async fn signing_out_brings_the_welcome_screen_back(cx: &mut TestAppContext) {
     let (view, cx) = boot_signed_out(cx);
     cx.update(|window, cx| view.update(cx, |view, cx| view.dismiss_welcome(window, cx)));
