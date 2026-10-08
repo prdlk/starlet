@@ -123,6 +123,9 @@ or supply it at runtime:
 STARLET_GITHUB_CLIENT_ID=Iv23liXXXXXXXXXXXXXX cargo run --release
 ```
 
+Or put `STARLET_GITHUB_CLIENT_ID=Iv23li…` in a git-ignored `.env` at the repo
+root; every `just` recipe (`build`, `release`, `run`, `install`, …) loads it.
+
 Click **Sign in**, type the code GitHub shows you, and the first sync starts.
 The token is written to your OS keychain — Keychain on macOS, Credential
 Manager on Windows, Secret Service on Linux — and never to the database, a
