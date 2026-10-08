@@ -3,6 +3,11 @@
 # The toolchain comes from rust-toolchain.toml; nothing here names a version.
 
 set shell := ["bash", "-uc"]
+# Load `.env` (if present) into every recipe's environment, so
+# STARLET_GITHUB_CLIENT_ID reaches both the compile-time `option_env!` and the
+# runtime lookup. Global rather than per-recipe: cargo rebuilds when an
+# `option_env!` value changes, so build/test/run must all see the same value.
+set dotenv-load
 
 # Where `just seed` and `just demo` put their scratch database.
 demo_db := "/tmp/starlet-demo.db"

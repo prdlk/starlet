@@ -15,5 +15,7 @@ node_modules/
 .blume/
 .blume-verify/
 dist/
+
+# Local secrets and build-time config, loaded by the Justfile.
 .env
-.env.local
+.env.*
