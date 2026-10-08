@@ -108,6 +108,9 @@ pub struct SearchView {
     layout_generation: usize,
 
     sync: SyncStatus,
+    /// Whether the session had a client at the last check, so only the
+    /// signed-out → signed-in transition starts a sync.
+    had_client: bool,
     /// When the last sync finished, for the status line.
     last_sync: Option<chrono::DateTime<chrono::Utc>>,
     /// Held so the work is cancelled when the view goes away.
@@ -139,11 +142,17 @@ impl SearchView {
             cx.subscribe_in(&filters, window, Self::on_filter_event),
         ];
         // The avatar, the welcome screen, and the empty state all depend on
-        // sign-in state.
+        // sign-in state. A client appearing means someone just signed in, and
+        // nothing else would start their first sync until the next interval.
         subscriptions.push(cx.observe_global::<Session>(|this: &mut Self, cx| {
             if !Session::is_signed_in(cx) {
                 this.welcome_dismissed = false;
             }
+            let has_client = Session::global(cx).github.is_some();
+            if has_client && !this.had_client {
+                this.start_sync_inner(None, cx);
+            }
+            this.had_client = has_client;
             cx.notify();
         }));
 
@@ -163,6 +172,7 @@ impl SearchView {
             hero_grow_from: 1.0,
             layout_generation: 0,
             sync: SyncStatus::Idle,
+            had_client: Session::global(cx).github.is_some(),
             last_sync: None,
             _sync_task: None,
             _schedule_task: None,
@@ -424,7 +434,7 @@ impl SearchView {
         // currently asking. On the sign-in screen that is signing in, not
         // opening a repository that is not on screen.
         if self.shows_welcome(cx) {
-            SignInFlow::start(window, cx);
+            SignInFlow::start(cx.weak_entity(), window, cx);
             return;
         }
         let Some(repo) = self.selected_repo(cx) else {
@@ -737,7 +747,7 @@ impl SearchView {
         if Session::is_signed_in(cx) {
             self.start_sync(None, window, cx);
         } else {
-            SignInFlow::start(window, cx);
+            SignInFlow::start(cx.weak_entity(), window, cx);
         }
     }
 
@@ -792,6 +802,11 @@ impl SearchView {
     /// Every repository currently in memory. The analysis dialog needs them.
     pub fn repos(&self) -> &[Arc<Repo>] {
         &self.repos
+    }
+
+    /// What the sync engine is doing. The sign-in dialog shows it.
+    pub fn sync_status(&self) -> &SyncStatus {
+        &self.sync
     }
 
     pub fn refresh_after_tag_change(&mut self, cx: &mut Context<Self>) {
@@ -893,7 +908,10 @@ impl SearchView {
                                 .primary()
                                 .xsmall()
                                 .label("Sign in")
-                                .on_click(|_, window, cx| SignInFlow::start(window, cx)),
+                                .on_click({
+                                    let this = cx.weak_entity();
+                                    move |_, window, cx| SignInFlow::start(this.clone(), window, cx)
+                                }),
                         )
                     }),
             )
@@ -987,7 +1005,10 @@ impl SearchView {
                     .primary()
                     .icon(IconName::GitHub)
                     .label("Sign in with GitHub")
-                    .on_click(|_, window, cx| SignInFlow::start(window, cx)),
+                    .on_click({
+                        let this = cx.weak_entity();
+                        move |_, window, cx| SignInFlow::start(this.clone(), window, cx)
+                    }),
             )
             .when(has_local_data, |this| {
                 this.child(

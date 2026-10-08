@@ -5,19 +5,21 @@
 //! goes straight from the poll result into the keychain and the session — it is
 //! never held in view state and never logged.
 
-use std::time::Duration;
-
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Task, Window, div, px,
+    AnyWindowHandle, App, AppContext as _, ClipboardItem, Context, IntoElement, ParentElement as _,
+    Render, SharedString, Styled as _, Subscription, Task, WeakEntity, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     ActiveTheme as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    progress::Progress,
+    v_flex,
 };
 use starlet_sync::{DeviceFlow, GitHub, PollOutcome, TokenStore};
 
+use crate::search::{SearchView, SyncStatus};
 use crate::services::{AuthStatus, Backend, Session};
 
 /// Where the dialog is in the flow.
@@ -37,12 +39,19 @@ enum Stage {
 
 pub struct SignInFlow {
     stage: Stage,
+    /// The workspace runs the first sync; the dialog mirrors its progress.
+    workspace: WeakEntity<SearchView>,
+    window: AnyWindowHandle,
+    /// Set once the sync has been seen running, so a later idle status means
+    /// it finished rather than that it has not started.
+    sync_started: bool,
     _task: Option<Task<()>>,
+    _observe: Option<Subscription>,
 }
 
 impl SignInFlow {
     /// Open the dialog and begin the flow.
-    pub fn start(window: &mut Window, cx: &mut App) {
+    pub fn start(workspace: WeakEntity<SearchView>, window: &mut Window, cx: &mut App) {
         let Some(client_id) = starlet_sync::client_id() else {
             window.push_notification(
                 gpui_component::notification::Notification::error(
@@ -53,7 +62,8 @@ impl SignInFlow {
             return;
         };
 
-        let view = cx.new(|cx| SignInFlow::new(client_id, cx));
+        let handle = window.window_handle();
+        let view = cx.new(|cx| SignInFlow::new(client_id, workspace, handle, cx));
         let content = view.clone();
         window.open_dialog(cx, move |dialog, _, _| {
             dialog
@@ -72,13 +82,47 @@ impl SignInFlow {
         cx.refresh_windows();
     }
 
-    fn new(client_id: String, cx: &mut Context<Self>) -> Self {
+    fn new(
+        client_id: String,
+        workspace: WeakEntity<SearchView>,
+        window: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let observe = workspace
+            .upgrade()
+            .map(|ws| cx.observe(&ws, |this, _, cx| this.sync_changed(cx)));
         let mut this = Self {
             stage: Stage::Requesting,
+            workspace,
+            window,
+            sync_started: false,
             _task: None,
+            _observe: observe,
         };
         this.request(client_id, cx);
         this
+    }
+
+    fn sync_status(&self, cx: &App) -> Option<SyncStatus> {
+        let ws = self.workspace.upgrade()?;
+        Some(ws.read(cx).sync_status().clone())
+    }
+
+    /// Follow the workspace's sync; close once the first one has finished.
+    fn sync_changed(&mut self, cx: &mut Context<Self>) {
+        match self.sync_status(cx) {
+            Some(SyncStatus::Running { .. }) => self.sync_started = true,
+            Some(SyncStatus::Idle)
+                if self.sync_started && matches!(self.stage, Stage::Succeeded { .. }) =>
+            {
+                let _ = self
+                    .window
+                    .update(cx, |_, window, cx| window.close_dialog(cx));
+                return;
+            }
+            _ => {}
+        }
+        cx.notify();
     }
 
     fn request(&mut self, client_id: String, cx: &mut Context<Self>) {
@@ -198,14 +242,9 @@ impl SignInFlow {
                 this.stage = Stage::Succeeded {
                     login: login.into(),
                 };
-                cx.notify();
+                // The sync may already be done for a small account.
+                this.sync_changed(cx);
             });
-            // Give the success state a beat to be read, then get out of the way
-            // and let the workspace start its first sync.
-            cx.background_executor()
-                .timer(Duration::from_millis(900))
-                .await;
-            let _ = cx.update(|cx| cx.refresh_windows());
         }));
     }
 
@@ -294,12 +333,58 @@ impl Render for SignInFlow {
                 )
                 .into_any_element(),
 
-            Stage::Succeeded { login } => v_flex()
-                .gap_2()
-                .child(div().text_sm().child(SharedString::from(format!(
-                    "Signed in as {login}. Syncing your stars…"
-                ))))
-                .into_any_element(),
+            Stage::Succeeded { login } => {
+                let signed_in = div()
+                    .text_sm()
+                    .child(SharedString::from(format!("Signed in as {login}.")));
+                let muted = cx.theme().muted_foreground;
+                match self.sync_status(cx) {
+                    Some(SyncStatus::Running { phase, done, total }) => {
+                        let count = match total {
+                            Some(total) => format!("{} of {total}", done.min(total)),
+                            None => done.to_string(),
+                        };
+                        v_flex()
+                            .gap_3()
+                            .child(signed_in)
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(phase.label())
+                                    .child(SharedString::from(count)),
+                            )
+                            // Without a total there is nothing to fill
+                            // against; the climbing count carries it.
+                            .when_some(total, |this, total| {
+                                let pct = if total == 0 {
+                                    100.0
+                                } else {
+                                    done as f32 / total as f32 * 100.0
+                                };
+                                this.child(Progress::new().value(pct))
+                            })
+                            .into_any_element()
+                    }
+                    Some(SyncStatus::Failed(message)) => v_flex()
+                        .gap_3()
+                        .child(signed_in)
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().danger)
+                                .child(SharedString::from(message)),
+                        )
+                        .into_any_element(),
+                    _ => v_flex()
+                        .gap_3()
+                        .child(signed_in)
+                        .child(div().text_xs().text_color(muted).child("Starting sync…"))
+                        .child(Progress::new())
+                        .into_any_element(),
+                }
+            }
 
             Stage::Failed(message) => v_flex()
                 .gap_2()

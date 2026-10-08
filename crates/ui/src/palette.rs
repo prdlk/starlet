@@ -312,7 +312,7 @@ fn run<T: 'static>(
         Command::Appearance(appearance) => {
             crate::settings::set_appearance(appearance, window, cx);
         }
-        Command::SignIn => crate::signin::SignInFlow::start(window, cx),
+        Command::SignIn => crate::signin::SignInFlow::start(owner, window, cx),
         Command::SignOut => window.dispatch_action(Box::new(crate::actions::SignOut), cx),
     }
 }
