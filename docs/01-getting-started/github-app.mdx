@@ -71,6 +71,17 @@ STARLET_GITHUB_CLIENT_ID=Iv23liXXXXXXXXXXXXXX cargo run --release
 ```
 
   </Tab>
+  <Tab title="Keep it in .env">
+
+```sh
+echo 'STARLET_GITHUB_CLIENT_ID=Iv23liXXXXXXXXXXXXXX' > .env
+just release   # or: just build, just run, just install
+```
+
+The Justfile's `set dotenv-load` exports `.env` to every recipe, so the value
+is both baked in and present at run time. `.env` is git-ignored.
+
+  </Tab>
 </Tabs>
 
 Without a client ID Starlet still runs: it searches whatever is already in the
